@@ -1,0 +1,13 @@
+{
+    "username": "root",
+    "password": "Password",
+    "hostname": "127.0.0.1",
+    "port": "3306",
+    "database_name": "kiteConnect",
+    "api_key": "gq2wohvza3uf7wy6",
+    "api_secret": "082tsx0b94cgea6ahrq4yeiu19qq269t",
+    "userID": "TG8155",
+    "pwd": "Peakyblunder1!",
+    "totp_key": "BUOKB5CTXDULYS6DHKFT3HBOCJPLT4B5",
+    "AccessToken": "AvQoukl04Z86ItK49EuI78vg32WNfXgc"
+}
