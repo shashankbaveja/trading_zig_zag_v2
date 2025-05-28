@@ -935,6 +935,189 @@ class TradingStrategy(BaseStrategy):
         print("Sample pattern tags:\n", df[df['pattern_tag'] != ""]['pattern_tag'].head())
         return df
 
+def calculate_performance_metrics(signals_df: pd.DataFrame, 
+                                  initial_capital: float, 
+                                  price_column: str = 'close',
+                                  **kwargs) -> dict:
+    """
+    Calculates PnL and other performance metrics from strategy signals.
+
+    Args:
+        signals_df: DataFrame from TradingStrategy.generate_signals(), 
+                    must include 'signal', 'pattern_tag', and price_column.
+                    Index must be a DatetimeIndex.
+        initial_capital: The starting capital for the simulation.
+        price_column: Column in signals_df to use for entry/exit prices.
+        **kwargs: Can include 'annual_rfr' (e.g., 0.02 for 2%).
+
+    Returns:
+        A dictionary containing various performance metrics.
+    """
+    if not isinstance(signals_df.index, pd.DatetimeIndex):
+        print("Error in calculate_performance_metrics: signals_df must have a DatetimeIndex.")
+        return {}
+    if price_column not in signals_df.columns:
+        print(f"Error in calculate_performance_metrics: price_column '{price_column}' not found in signals_df.")
+        return {}
+    if 'signal' not in signals_df.columns:
+        print("Error in calculate_performance_metrics: 'signal' column not found in signals_df.")
+        return {}
+    if 'pattern_tag' not in signals_df.columns:
+        print("Error in calculate_performance_metrics: 'pattern_tag' column not found in signals_df.")
+        return {}
+
+    active_long_trade = None
+    active_short_trade = None
+    completed_trades = []
+
+    for current_dt, row in signals_df.iterrows():
+        current_price = row[price_column]
+        signal_value = row['signal']
+        pattern_tag_text = str(row['pattern_tag']).lower() # Ensure string and lowercase
+
+        # Check for exits first based on pattern_tag
+        if signal_value == -1: # Potential exit signal
+            if "long exit" in pattern_tag_text and active_long_trade:
+                pnl = current_price - active_long_trade['entry_price']
+                completed_trades.append({
+                    'entry_time': active_long_trade['entry_time'],
+                    'exit_time': current_dt,
+                    'entry_price': active_long_trade['entry_price'],
+                    'exit_price': current_price,
+                    'trade_type': 'long',
+                    'pnl': pnl
+                })
+                active_long_trade = None
+            elif "short exit" in pattern_tag_text and active_short_trade:
+                pnl = active_short_trade['entry_price'] - current_price
+                completed_trades.append({
+                    'entry_time': active_short_trade['entry_time'],
+                    'exit_time': current_dt,
+                    'entry_price': active_short_trade['entry_price'],
+                    'exit_price': current_price,
+                    'trade_type': 'short',
+                    'pnl': pnl
+                })
+                active_short_trade = None
+        
+        # Check for entries
+        if signal_value == 1: # Potential entry signal
+            if "long entry" in pattern_tag_text and not active_long_trade:
+                active_long_trade = {'entry_price': current_price, 'entry_time': current_dt}
+            elif "short entry" in pattern_tag_text and not active_short_trade:
+                active_short_trade = {'entry_price': current_price, 'entry_time': current_dt}
+
+    metrics = {}
+    if not completed_trades:
+        metrics['total_trades'] = 0
+        metrics['info'] = "No completed trades found to calculate metrics."
+        return metrics
+
+    trades_df = pd.DataFrame(completed_trades)
+    trades_df.sort_values(by='exit_time', inplace=True) # Ensure chronological order for drawdown
+
+    metrics['total_trades'] = len(trades_df)
+    
+    winning_trades_df = trades_df[trades_df['pnl'] > 0]
+    losing_trades_df = trades_df[trades_df['pnl'] < 0]
+    
+    metrics['winning_trades'] = len(winning_trades_df)
+    metrics['losing_trades'] = len(losing_trades_df)
+    
+    if metrics['total_trades'] > 0:
+        metrics['win_rate_pct'] = (metrics['winning_trades'] / metrics['total_trades']) * 100
+    else:
+        metrics['win_rate_pct'] = 0
+
+    metrics['total_pnl'] = trades_df['pnl'].sum()
+    metrics['gross_profit'] = winning_trades_df['pnl'].sum()
+    metrics['gross_loss'] = abs(losing_trades_df['pnl'].sum()) # Sum of absolute losses
+
+    if metrics['total_trades'] > 0:
+        metrics['average_pnl_per_trade'] = metrics['total_pnl'] / metrics['total_trades']
+    else:
+        metrics['average_pnl_per_trade'] = 0
+        
+    if metrics['winning_trades'] > 0:
+        metrics['average_profit_per_winning_trade'] = metrics['gross_profit'] / metrics['winning_trades']
+    else:
+        metrics['average_profit_per_winning_trade'] = 0
+
+    if metrics['losing_trades'] > 0:
+        metrics['average_loss_per_losing_trade'] = metrics['gross_loss'] / metrics['losing_trades'] # gross_loss is positive
+    else:
+        metrics['average_loss_per_losing_trade'] = 0
+
+    if metrics['gross_loss'] > 0:
+        metrics['profit_factor'] = metrics['gross_profit'] / metrics['gross_loss']
+    elif metrics['gross_profit'] > 0: # Gross loss is 0 but gross profit > 0
+        metrics['profit_factor'] = float('inf') 
+    else: # Both are 0
+        metrics['profit_factor'] = 0 
+
+    # Maximum Drawdown Calculation
+    trades_df['cumulative_pnl'] = trades_df['pnl'].cumsum()
+    trades_df['equity_curve'] = initial_capital + trades_df['cumulative_pnl']
+    trades_df['running_max_equity'] = trades_df['equity_curve'].cummax()
+    trades_df['drawdown_absolute'] = trades_df['running_max_equity'] - trades_df['equity_curve']
+    
+    metrics['max_drawdown_absolute'] = trades_df['drawdown_absolute'].max()
+    if metrics['max_drawdown_absolute'] is None or pd.isna(metrics['max_drawdown_absolute']):
+        metrics['max_drawdown_absolute'] = 0.0
+    
+    if metrics['max_drawdown_absolute'] > 0:
+        idx_max_drawdown = trades_df['drawdown_absolute'].idxmax()
+        peak_equity_at_max_drawdown = trades_df.loc[idx_max_drawdown, 'running_max_equity']
+
+        if peak_equity_at_max_drawdown > 0 : 
+            metrics['max_drawdown_percentage'] = (metrics['max_drawdown_absolute'] / peak_equity_at_max_drawdown) * 100
+        else:
+             metrics['max_drawdown_percentage'] = float('inf') 
+    else: 
+        metrics['max_drawdown_percentage'] = 0.0
+
+    # Sharpe Ratio Calculation (per-trade)
+    if len(trades_df) >= 2:
+        # Calculate PnL percentage for each trade
+        trades_df['pnl_pct'] = trades_df.apply(
+            lambda row: ((row['exit_price'] - row['entry_price']) / row['entry_price']) 
+                        if row['trade_type'] == 'long' and row['entry_price'] != 0 else \
+                        (((row['entry_price'] - row['exit_price']) / row['entry_price'])
+                        if row['trade_type'] == 'short' and row['entry_price'] != 0 else 0.0),
+            axis=1
+        )
+
+        # Calculate holding period in days for each trade
+        trades_df['holding_period_days'] = (trades_df['exit_time'] - trades_df['entry_time']).dt.total_seconds() / (24 * 60 * 60.0)
+        
+        # Calculate risk-free rate for each trade based on its holding period
+        # annual_rfr is passed as a parameter to the main function, e.g. 0.02 for 2%
+        annual_rfr_param = kwargs.get('annual_rfr', 0.02) # Get from kwargs or default
+        trades_df['rfr_per_trade'] = (annual_rfr_param / 365.0) * trades_df['holding_period_days']
+        
+        # Calculate excess return over trade-specific RFR
+        trades_df['excess_return_pct'] = trades_df['pnl_pct'] - trades_df['rfr_per_trade']
+        
+        mean_excess_return_pct = trades_df['excess_return_pct'].mean()
+        std_excess_return_pct = trades_df['excess_return_pct'].std()
+
+        if pd.isna(std_excess_return_pct) or std_excess_return_pct < 1e-9: 
+            if mean_excess_return_pct > 1e-9: 
+                metrics['sharpe_ratio_per_trade'] = float('inf')
+            elif mean_excess_return_pct < -1e-9: 
+                metrics['sharpe_ratio_per_trade'] = float('-inf')
+            else: 
+                metrics['sharpe_ratio_per_trade'] = 0.0 
+        else:
+            metrics['sharpe_ratio_per_trade'] = mean_excess_return_pct / std_excess_return_pct
+    else: 
+        metrics['sharpe_ratio_per_trade'] = 0.0 
+
+    # For PnL values, let's assume they are per unit.
+    # If trade_units are involved, PnL needs to be multiplied by trade_units * price_per_point (if applicable)
+
+    return metrics
+
 if __name__ == '__main__':
     print("--- Testing trading_strategies.py (ZigZag Harmonic Strategy) ---")
     dp = DataPrep()
@@ -942,7 +1125,7 @@ if __name__ == '__main__':
         test_token = 256265 
         sim_start_date = date(2025, 5, 1) 
         sim_end_date = date(2025, 5, 25)   
-        warm_up_period_days = 10 # Number of extra days for warm-up
+        warm_up_period_days = 10 # Consistent with config `warm_up_days_for_strategy`
         
         base_data_interval_str = 'minute' 
         print(f"Attempting to fetch 1-MINUTE data for token {test_token} from {sim_start_date} to {sim_end_date} with {warm_up_period_days} warm-up days...")
@@ -965,37 +1148,61 @@ if __name__ == '__main__':
                 print("Set 'date' column as DatetimeIndex for the 1-minute data.")
             else:
                 print("Error: 'date' column missing in 1-minute data to set as index.")
-                exit()
+                # exit() # Keep running to see if calculate_performance_metrics handles it
 
-            strategy_params = {
-                'instrument_token': test_token, 
-                # Other parameters hardcoded in __init__ for this test run
-            }
+            strategy_params_from_config = {}
+            test_initial_capital = 100000 # Default if not in config
+            # In a real scenario, load from trading_config.ini
+            # For this test, use defaults or manually set if necessary.
+            config = configparser.ConfigParser()
+            # Check if config file exists before trying to read
+            if os.path.exists('trading_config.ini'):
+                config.read('trading_config.ini')
+                if 'TRADING_STRATEGY' in config:
+                    strategy_params_from_config = dict(config['TRADING_STRATEGY'])
+                if 'SIMULATOR_SETTINGS' in config and 'initial_capital' in config['SIMULATOR_SETTINGS']:
+                    test_initial_capital = float(config['SIMULATOR_SETTINGS']['initial_capital'])
+            else:
+                print("Warning: trading_config.ini not found. Using default strategy parameters and initial capital for test.")
+
+
             # Pass the original sim_start_date as the actual simulation start date
             strategy_instance = TradingStrategy(
                 kite_apis_instance=dp.k_apis, 
                 simulation_actual_start_date=sim_start_date, 
-                **strategy_params
+                **strategy_params_from_config
             )
             
-            print("\nRunning generate_signals with 1-minute data (including warm-up) for MTF test...")
+            print("\nRunning generate_signals with 1-minute data (including warm-up)...")
             visualization_df = strategy_instance.generate_signals(ohlcv_data_1min.copy()) 
             
-            print("\n--- DataFrame with Signals and ZigZag Prices (on 1-min data) ---")
-            print(visualization_df.head())
+            print("\n--- DataFrame with Signals (Sample) ---")
+            print(visualization_df[['signal', 'pattern_tag', 'close']].head()) # Show relevant columns
             
-            print("\nSample of ZigZag points plotted on 1-min data:")
-            zigzag_points_plotted = visualization_df[visualization_df['zigzag_price'].notna()]
-            print(zigzag_points_plotted.head())
-            if zigzag_points_plotted.empty:
-                print("No ZigZag points were plotted on the 1-minute data visualization.")
-
-            output_filename = "zigzag_visualization_data.csv"
+            print("\n--- Calculating Performance Metrics ---")
+            # Use the test_initial_capital defined/loaded above
+            performance_results = calculate_performance_metrics(visualization_df, 
+                                                                initial_capital=test_initial_capital, 
+                                                                price_column='close', # Explicitly pass for clarity
+                                                                annual_rfr=0.02) # Pass the desired annual RFR
+            
+            print("\n--- Performance Metrics Results ---")
+            if performance_results:
+                for key, value in performance_results.items():
+                    if isinstance(value, float):
+                        print(f"{key}: {value:.2f}")
+                    else:
+                        print(f"{key}: {value}")
+            else:
+                print("No performance metrics were calculated (e.g., due to data issues or no trades).")
+            
+            # Existing save to CSV
+            output_filename = "zigzag_visualization_data_with_metrics_test.csv" # Changed name slightly
             visualization_df.reset_index().to_csv(output_filename, index=False)
             print(f"\nVisualization data saved to {output_filename}")
 
         else:
-            print(f"Failed to fetch/prepare data. Cannot run test.")
+            print(f"Failed to fetch/prepare data. Cannot run full test.")
     else:
         print("DataPrep could not initialize kiteAPIs. Cannot run test.")
 
