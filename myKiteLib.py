@@ -196,7 +196,8 @@ class system_initialization:
     def save_intruments_to_db(self,data):
         self.con = sqlConnector.connect(host=self.mysql_hostname, user=self.mysql_username, password=self.mysql_password, database=self.mysql_database_name, port=self.mysql_port,auth_plugin='mysql_native_password')
         for i in range (0, len(data)):
-            query = "insert into kiteConnect.instruments_zerodha values({},'{}','{}','{}',{},'{}',{},{},{},'{}','{}','{}') ON DUPLICATE KEY UPDATE instrument_token=instrument_token;".format(data['instrument_token'].iloc[i],data['exchange_token'].iloc[i],data['tradingsymbol'].iloc[i],data['name'].iloc[i],data['last_price'].iloc[i],data['expiry'].iloc[i],data['strike'].iloc[i],data['tick_size'].iloc[i],data['lot_size'].iloc[i],data['instrument_type'].iloc[i],data['segment'].iloc[i],data['exchange'].iloc[i])
+            query = "insert into kiteConnect.instruments_zerodha values({},'{}','{}','{}',{},'{}',{},{},{},'{}','{}','{}',1) ON DUPLICATE KEY UPDATE instrument_token=instrument_token, is_active=1;".format(data['instrument_token'].iloc[i],data['exchange_token'].iloc[i],data['tradingsymbol'].iloc[i],data['name'].iloc[i],data['last_price'].iloc[i],data['expiry'].iloc[i],data['strike'].iloc[i],data['tick_size'].iloc[i],data['lot_size'].iloc[i],data['instrument_type'].iloc[i],data['segment'].iloc[i],data['exchange'].iloc[i])
+            # print(query)
             cur = self.con.cursor()
             cur.execute(query)
             self.con.commit()
@@ -443,7 +444,7 @@ class kiteAPIs:
         return df['instrument_token'].values.astype(int).tolist()
     
     def get_instrument_active_tokens(self, instrument_type, end_dt_backfill):
-        query = f"SELECT instrument_token FROM kiteConnect.instruments_zerodha where expiry >= '{end_dt_backfill}' and instrument_type = '{instrument_type}'".format(instrument_type, end_dt_backfill)
+        query = f"SELECT instrument_token FROM kiteConnect.instruments_zerodha where expiry >= '{end_dt_backfill}' and instrument_type = '{instrument_type}' and is_active = 1".format(instrument_type, end_dt_backfill)
         self.con = sqlConnector.connect(host=self.mysql_hostname, user=self.mysql_username, password=self.mysql_password, database=self.mysql_database_name, port=self.mysql_port,auth_plugin='mysql_native_password')
         df = pd.read_sql(query, self.con)
         self.con.close()
@@ -579,7 +580,10 @@ class kiteAPIs:
                     break  # Success, exit retry loop
                 except (KiteException, requests.exceptions.ReadTimeout, requests.exceptions.RequestException) as e:
                     print(f"  Error on attempt {attempt + 1} for token {t}: {type(e).__name__} - {str(e)}")
-                    if attempt < MAX_RETRIES - 1:
+                    if str(e) == 'invalid token':
+                        print(f"  Invalid token {t} found. Skipping.")
+                        break
+                    elif attempt < MAX_RETRIES - 1 and str(e) != 'invalid token':
                         print(f"  Retrying in {RETRY_DELAY_SECONDS} seconds...")
                         time.sleep(RETRY_DELAY_SECONDS)
                     else:
