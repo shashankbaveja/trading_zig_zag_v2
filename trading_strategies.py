@@ -1123,16 +1123,59 @@ if __name__ == '__main__':
     dp = DataPrep()
     if dp.k_apis:
         test_token = 256265 
-        sim_start_date = date(2025, 5, 1) 
-        sim_end_date = date(2025, 5, 25)   
-        warm_up_period_days = 10 # Consistent with config `warm_up_days_for_strategy`
+        # Default dates, to be overridden by config if available
+        sim_start_date_str_default = "2025-05-01"
+        sim_end_date_str_default = "2025-05-25"
         
+        warm_up_period_days = 10 
+        test_initial_capital = 100000 # Default if not in config
+        strategy_params_from_config = {}
+
+        config = configparser.ConfigParser()
+        actual_sim_start_date_str = sim_start_date_str_default
+        actual_sim_end_date_str = sim_end_date_str_default
+
+        if os.path.exists('trading_config.ini'):
+            config.read('trading_config.ini')
+            if 'TRADING_STRATEGY' in config:
+                strategy_params_from_config = dict(config['TRADING_STRATEGY'])
+                # Ensure warm_up_days is also read if present, converting to int
+                if 'warm_up_days_for_strategy' in strategy_params_from_config:
+                    try:
+                        warm_up_period_days = int(strategy_params_from_config['warm_up_days_for_strategy'])
+                    except ValueError:
+                        print(f"Warning: Could not parse warm_up_days_for_strategy from config. Using default: {warm_up_period_days}")
+            
+            if 'SIMULATOR_SETTINGS' in config:
+                sim_settings = config['SIMULATOR_SETTINGS']
+                if 'initial_capital' in sim_settings:
+                    try:
+                        test_initial_capital = float(sim_settings['initial_capital'])
+                    except ValueError:
+                        print(f"Warning: Could not parse initial_capital from config. Using default: {test_initial_capital}")
+                
+                actual_sim_start_date_str = sim_settings.get('simulation_start_date', sim_start_date_str_default)
+                actual_sim_end_date_str = sim_settings.get('simulation_end_date', sim_end_date_str_default)
+        else:
+            print("Warning: trading_config.ini not found. Using default parameters for test run.")
+
+        try:
+            sim_start_date = datetime.strptime(actual_sim_start_date_str, '%Y-%m-%d').date()
+            sim_end_date = datetime.strptime(actual_sim_end_date_str, '%Y-%m-%d').date()
+        except ValueError as e:
+            print(f"Error parsing dates from config/defaults: {e}. Reverting to hardcoded safe defaults.")
+            sim_start_date = date(2025, 5, 1)
+            sim_end_date = date(2025, 5, 25)
+        
+        print(f"Effective simulation period for this test run: {sim_start_date} to {sim_end_date}")
+        print(f"Effective warm-up days: {warm_up_period_days}")
+
         base_data_interval_str = 'minute' 
         print(f"Attempting to fetch 1-MINUTE data for token {test_token} from {sim_start_date} to {sim_end_date} with {warm_up_period_days} warm-up days...")
         
         ohlcv_data_1min = dp.fetch_and_prepare_data(
             instrument_token=test_token,
-            start_date_obj=sim_start_date, # This is the intended simulation start
+            start_date_obj=sim_start_date, 
             end_date_obj=sim_end_date,
             interval=base_data_interval_str, 
             warm_up_days=warm_up_period_days
@@ -1140,7 +1183,6 @@ if __name__ == '__main__':
 
         if ohlcv_data_1min is not None and not ohlcv_data_1min.empty:
             print(f"Fetched data (including warm-up) for {test_token}: {ohlcv_data_1min.shape}")
-            # print(ohlcv_data_1min.head())
             
             if 'date' in ohlcv_data_1min.columns:
                 ohlcv_data_1min['date'] = pd.to_datetime(ohlcv_data_1min['date'])
@@ -1148,25 +1190,7 @@ if __name__ == '__main__':
                 print("Set 'date' column as DatetimeIndex for the 1-minute data.")
             else:
                 print("Error: 'date' column missing in 1-minute data to set as index.")
-                # exit() # Keep running to see if calculate_performance_metrics handles it
 
-            strategy_params_from_config = {}
-            test_initial_capital = 100000 # Default if not in config
-            # In a real scenario, load from trading_config.ini
-            # For this test, use defaults or manually set if necessary.
-            config = configparser.ConfigParser()
-            # Check if config file exists before trying to read
-            if os.path.exists('trading_config.ini'):
-                config.read('trading_config.ini')
-                if 'TRADING_STRATEGY' in config:
-                    strategy_params_from_config = dict(config['TRADING_STRATEGY'])
-                if 'SIMULATOR_SETTINGS' in config and 'initial_capital' in config['SIMULATOR_SETTINGS']:
-                    test_initial_capital = float(config['SIMULATOR_SETTINGS']['initial_capital'])
-            else:
-                print("Warning: trading_config.ini not found. Using default strategy parameters and initial capital for test.")
-
-
-            # Pass the original sim_start_date as the actual simulation start date
             strategy_instance = TradingStrategy(
                 kite_apis_instance=dp.k_apis, 
                 simulation_actual_start_date=sim_start_date, 
@@ -1177,14 +1201,14 @@ if __name__ == '__main__':
             visualization_df = strategy_instance.generate_signals(ohlcv_data_1min.copy()) 
             
             print("\n--- DataFrame with Signals (Sample) ---")
-            print(visualization_df[['signal', 'pattern_tag', 'close']].head()) # Show relevant columns
+            print(visualization_df[['signal', 'pattern_tag', 'close']].head(3)) # Show relevant columns, reduced sample
+            print(visualization_df[visualization_df['signal'] != 0][['signal', 'pattern_tag', 'close']].head(6))
             
             print("\n--- Calculating Performance Metrics ---")
-            # Use the test_initial_capital defined/loaded above
             performance_results = calculate_performance_metrics(visualization_df, 
                                                                 initial_capital=test_initial_capital, 
-                                                                price_column='close', # Explicitly pass for clarity
-                                                                annual_rfr=0.02) # Pass the desired annual RFR
+                                                                price_column='close', 
+                                                                annual_rfr=0.02)
             
             print("\n--- Performance Metrics Results ---")
             if performance_results:
@@ -1194,10 +1218,9 @@ if __name__ == '__main__':
                     else:
                         print(f"{key}: {value}")
             else:
-                print("No performance metrics were calculated (e.g., due to data issues or no trades).")
+                print("No performance metrics were calculated.")
             
-            # Existing save to CSV
-            output_filename = "zigzag_visualization_data_with_metrics_test.csv" # Changed name slightly
+            output_filename = "zigzag_visualization_data_with_metrics_test.csv"
             visualization_df.reset_index().to_csv(output_filename, index=False)
             print(f"\nVisualization data saved to {output_filename}")
 
@@ -1206,4 +1229,4 @@ if __name__ == '__main__':
     else:
         print("DataPrep could not initialize kiteAPIs. Cannot run test.")
 
-    print("\n--- Test Run Complete ---") 
+    print("\n--- Test Run Complete ---")
