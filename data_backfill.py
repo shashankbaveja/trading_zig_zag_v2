@@ -51,7 +51,7 @@ if __name__ == "__main__":
     tokenList = [256265] ## NIFTY INDEX
     tokenList.extend(callKite.get_instrument_active_tokens('CE',end_dt_backfill))
     tokenList.extend(callKite.get_instrument_active_tokens('PE',end_dt_backfill))
-    tokenList.extend(callKite.get_instrument_active_tokens('FUT',end_dt_backfill)
+    tokenList.extend(callKite.get_instrument_active_tokens('FUT',end_dt_backfill))
     tokenList.extend(callKite.get_instrument_all_tokens('EQ'))
 
 

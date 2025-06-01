@@ -137,5 +137,4 @@ Desktop.ini
 *.sublime-project
 *.sublime-workspace 
 
-
-*.csv
+index_data.csv

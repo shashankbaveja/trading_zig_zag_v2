@@ -110,6 +110,7 @@ class system_initialization:
             else:
                 return row[0]
         self.con.close()
+        cursor.close()
     def run_query_limit_1(self,query):
         cursor = self.con.cursor()
         cursor.execute(query)
@@ -119,6 +120,7 @@ class system_initialization:
                 return ''
             else:
                 return row[0]
+        cursor.close()
     def SaveAccessToken(self,Token):
         self.con = sqlConnector.connect(host=self.mysql_hostname, user=self.mysql_username, password=self.mysql_password, database=self.mysql_database_name, port=self.mysql_port,auth_plugin='mysql_native_password')
         q1 = "INSERT INTO kiteConnect.daily_token_log(token) Values('{}')"
@@ -131,6 +133,7 @@ class system_initialization:
         self.con.commit()
         print("saved token to DB")
         self.con.close()
+        cur.close()
 
 
     def kite_chrome_login_generate_temp_token(self):
@@ -203,6 +206,7 @@ class system_initialization:
             self.con.commit()
             # print("saved token to DB")
         self.con.close()
+        cur.close()
 
 class OrderPlacement(system_initialization):
     def __init__(self):
@@ -517,7 +521,7 @@ class kiteAPIs:
             group_data_indexed = group_data.set_index('timestamp')
             
             resampled_one_group = group_data_indexed.resample(
-                rule=f'{to_interval}T',
+                rule=f'{to_interval}min',
                 label='left', # Label of the interval is its start time
                 origin=origin_time_for_day
             ).agg(agg_rules)

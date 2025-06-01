@@ -4,21 +4,11 @@ globs:
 alwaysApply: true
 ---
 I want you to behave like an expert trader who specializes in intraday options trading.
-My objective is to build a model to predict short term reversals in the market and take advantage of the same. Short term means 5-10 minute window
+My objective is to implement our startegy and backtest it. The strategy is derived from a pine script from trading view and is in the file zigzag.pine
 We will primarily look at NIFTY50 Index and trade options for it. INDEX NIFTY 50 instrument token = 256265
-
-I want to look at movements (downtrend reversal) in the index and accordingly but call options with clear target price and stop loss. 
-I want to build multiple strategies with a lot of technical indicators and predict that reversal on the index and simulate the trading on the option. 
 
 
 we will work in the following virtual environment.
 /opt/anaconda3/bin/activate && conda activate /opt/anaconda3/envs/KiteConnect
-
-WHEN ASKED TO ADD A NEW STRATEGY, YOU CAN ONLY 'ADD' TO THE EXISTING FILE. DO NOT OVERWTIRE OR CHANGE THE EXISTING STATISTICS OR EXISTING STARTEGY. REST OF THE FILE IS FULLY FUNCTIONAL, MAINTAIN ITS FUNCTIONALITY
-
-DOCUMENTATION IS IMPORTANT
-use docs/implementation.md file to track and update the progress with details around the implementation
-use docs/strategy_documentation/ to write an indepth documentation of how a strategy is working whenever you have completed one implementation.
-
 
 link to git - https://github.com/shashankbaveja/trading_setup_zigzag.git

@@ -51,27 +51,31 @@ class DataPrep:
                 print(f"DataPrep Warning: Unknown interval format '{interval_str}'. Defaulting to 1 minute.")
                 return 1
 
-    def fetch_and_prepare_data(self, instrument_token: int, start_date_obj: date, end_date_obj: date, interval: str = 'minute', warm_up_days: int = 0) -> pd.DataFrame:
+    def fetch_and_prepare_data(self, instrument_token: int, start_date_obj: date, end_date_obj: date, primary_interval_minutes: int = 1, warm_up_days: int = 0) -> dict:
         """
         Fetches 1-minute historical data from the database via myKiteLib,
-        then resamples it to the specified 'interval' if needed, and prepares it.
+        prepares it (cleaned_one_minute_df), and then resamples it to the 
+        specified 'primary_interval_minutes' if needed (main_interval_df).
         Includes an optional warm-up period by fetching data prior to start_date_obj.
 
         Args:
             instrument_token: The instrument token to fetch data for.
             start_date_obj: The intended start date for the simulation/analysis period.
             end_date_obj: The end date for data fetching (datetime.date object).
-            interval: The target candle interval (e.g., 'minute', '5minute', '15minute').
+            primary_interval_minutes: The target candle interval in minutes (e.g., 1, 5, 60, 1440).
             warm_up_days: Number of extra days of data to fetch before start_date_obj for warm-up.
 
         Returns:
-            A pandas DataFrame with prepared OHLCV data at the target interval,
-            sorted by date, with a 'date' column (datetime), and numeric OHLCV columns.
-            Returns an empty DataFrame if fetching or preparation fails.
+            A dictionary containing two pandas DataFrames:
+            {'main_interval_data': DataFrame at the target primary_interval_minutes,
+             'one_minute_data': DataFrame with cleaned 1-minute data},
+            both with a 'date' column as DatetimeIndex, and numeric OHLCV columns.
+            Returns an empty dictionary with empty DataFrames if fetching or preparation fails.
         """
+        empty_return = {'main_interval_data': pd.DataFrame(), 'one_minute_data': pd.DataFrame()}
         if not self.k_apis:
             print("DataPrep Error: kiteAPIs not initialized. Cannot fetch data.")
-            return pd.DataFrame()
+            return empty_return
 
         actual_fetch_start_date = start_date_obj
         if warm_up_days > 0:
@@ -80,17 +84,8 @@ class DataPrep:
 
         start_date_str = actual_fetch_start_date.strftime('%Y-%m-%d')
         end_date_str = end_date_obj.strftime('%Y-%m-%d')
-
-        # User requested to fetch as much data as needed.
-        # For ZigZag with 5 points (XABCD), a considerable history might be needed.
-        # Let's fetch a longer period (e.g., 1 year) before start_date_obj for robust ZigZag calculation,
-        # then slice it if necessary, though the strategy will operate on the full fetched data.
-        # The simulator passes trade_start_date and trade_end_date. We should honor these for the *simulation window*.
-        # The strategy *itself* needs historical data *prior* to trade_start_date to form initial patterns.
-        # This implies fetch_and_prepare_data should fetch data from an earlier point.
-        # For now, we fetch what's requested by the simulator. The strategy must cope or this needs redesign.
         
-        print(f"DataPrep: Fetching 1-minute data for token {instrument_token} from {start_date_str} to {end_date_str} (to be resampled to {interval})...")
+        print(f"DataPrep: Fetching 1-minute base data for token {instrument_token} from {start_date_str} to {end_date_str} (to be potentially resampled to {primary_interval_minutes} min)...")
         
         historical_df_minute = self.k_apis.extract_data_from_db(
             from_date=start_date_str,
@@ -101,18 +96,23 @@ class DataPrep:
 
         if historical_df_minute is None or historical_df_minute.empty:
             print(f"DataPrep: No 1-minute data fetched for token {instrument_token} from {start_date_str} to {end_date_str}.")
-            return pd.DataFrame()
+            return empty_return
 
-        print(f"DataPrep: Successfully fetched {len(historical_df_minute)} rows of 1-minute data. Preparing...")
+        print(f"DataPrep: Successfully fetched {len(historical_df_minute)} rows of 1-minute data. Preparing base 1-min data...")
 
+        # --- Prepare cleaned_one_minute_df ---
         if 'timestamp' in historical_df_minute.columns:
             historical_df_minute.rename(columns={'timestamp': 'date'}, inplace=True)
         
         if 'date' not in historical_df_minute.columns:
             print("DataPrep Critical Error: 'date' column not found in 1-minute data after potential rename.")
-            return pd.DataFrame()
+            return empty_return
             
-        historical_df_minute['date'] = pd.to_datetime(historical_df_minute['date'])
+        try:
+            historical_df_minute['date'] = pd.to_datetime(historical_df_minute['date'])
+        except Exception as e:
+            print(f"DataPrep Critical Error: Failed to convert 'date' column to datetime for 1-min data: {e}.")
+            return empty_return
         
         cols_to_numeric = ['open', 'high', 'low', 'close', 'volume']
         for col in cols_to_numeric:
@@ -123,85 +123,121 @@ class DataPrep:
         
         historical_df_minute.sort_values(by=['date'], inplace=True)
         historical_df_minute.drop_duplicates(subset=['date'], keep='first', inplace=True)
+        
+        required_cols_for_1min = ['date', 'open', 'high', 'low', 'close'] # Volume optional for 1-min primary use
+        historical_df_minute.dropna(subset=required_cols_for_1min, inplace=True)
 
-        target_interval_minutes = self._parse_interval_string(interval)
+        if not all(col in historical_df_minute.columns for col in required_cols_for_1min):
+            print(f"DataPrep Error: Missing one or more required columns {required_cols_for_1min} in 1-min data after cleaning.")
+            return empty_return
+            
+        historical_df_minute.set_index('date', inplace=True)
+        cleaned_one_minute_df = historical_df_minute.copy()
+        print(f"DataPrep: Prepared 'cleaned_one_minute_df' with {len(cleaned_one_minute_df)} rows, index type: {type(cleaned_one_minute_df.index)}")
 
-        if target_interval_minutes > 1:
-            print(f"DataPrep: Resampling 1-minute data to {target_interval_minutes}-minute interval ('{interval}')...")
+        # --- Prepare main_interval_df ---
+        main_interval_df = pd.DataFrame()
+
+        if primary_interval_minutes > 1:
+            print(f"DataPrep: Resampling 1-minute data to {primary_interval_minutes}-minute interval...")
             if not hasattr(self.k_apis, 'convert_minute_data_interval'):
                 print("DataPrep Error: kiteAPIs object does not have method 'convert_minute_data_interval'. Cannot resample.")
-                print("DataPrep Warning: Proceeding with 1-minute data as resampling function is missing.")
-                final_df = historical_df_minute
+                print(f"DataPrep Warning: Returning 1-minute data as 'main_interval_data' as resampling function is missing and requested interval was {primary_interval_minutes} min.")
+                main_interval_df = cleaned_one_minute_df.copy()
             else:
                 try:
-                    # Pass the integer interval (target_interval_minutes) 
-                    # if k_apis.convert_minute_data_interval expects an integer.
-                    final_df = self.k_apis.convert_minute_data_interval(historical_df_minute.copy(), to_interval=target_interval_minutes) # Pass INTEGER interval
-                    if final_df is None or final_df.empty:
-                        print(f"DataPrep Error: Resampling to '{interval}' ({target_interval_minutes} mins) resulted in empty data. Check resampling logic.")
-                        return pd.DataFrame()
-                    print(f"DataPrep: Resampled to {len(final_df)} rows at '{interval}' ({target_interval_minutes} mins) interval.")
+                    # convert_minute_data_interval expects 'timestamp' column, and potentially 'instrument_token'.
+                    # cleaned_one_minute_df has 'date' as index. Reset index and rename.
+                    df_for_resample = cleaned_one_minute_df.reset_index().rename(columns={'date': 'timestamp'})
+                    
+                    # Add instrument_token if not present and kite lib requires it (myKiteLib version seems to handle its absence for single token series)
+                    if 'instrument_token' not in df_for_resample.columns:
+                         df_for_resample['instrument_token'] = instrument_token # Assuming it's for the current token
+                    
+                    resampled_df = self.k_apis.convert_minute_data_interval(df_for_resample, to_interval=primary_interval_minutes)
+                    
+                    if resampled_df is None or resampled_df.empty:
+                        print(f"DataPrep Error: Resampling to '{primary_interval_minutes}' mins resulted in empty data. Check resampling logic.")
+                        return empty_return # Or fallback to 1-min for main_interval_df? For now, fail.
+                    
+                    print(f"DataPrep: Resampled to {len(resampled_df)} rows at '{primary_interval_minutes}' mins interval.")
+                    main_interval_df = resampled_df
+
+                    # Post-resampling processing for main_interval_df
+                    if 'timestamp' in main_interval_df.columns and 'date' not in main_interval_df.columns:
+                        main_interval_df.rename(columns={'timestamp': 'date'}, inplace=True)
+                    
+                    if 'date' not in main_interval_df.columns:
+                        # Attempt to recover if index is datetime and unnamed from reset_index
+                        if isinstance(main_interval_df.index, pd.DatetimeIndex) and main_interval_df.index.name is None:
+                             main_interval_df.reset_index(inplace=True)
+                             if main_interval_df.columns[0] == 'index': # common name for unnamed index
+                                main_interval_df.rename(columns={'index': 'date'}, inplace=True)
+                             else: # Try to use the first column if it's the date
+                                main_interval_df.rename(columns={main_interval_df.columns[0]: 'date'}, inplace=True)
+                        else:
+                            print(f"DataPrep Critical Error: 'date' column not found in resampled data. Columns: {main_interval_df.columns.tolist()}")
+                            return empty_return
+                    
+                    try:
+                        main_interval_df['date'] = pd.to_datetime(main_interval_df['date'])
+                    except Exception as e:
+                        print(f"DataPrep Critical Error: Failed to convert 'date' column to datetime for resampled data: {e}.")
+                        return empty_return
+
+                    required_cols_for_main = ['date', 'open', 'high', 'low', 'close'] # Volume often present too
+                    main_interval_df.dropna(subset=required_cols_for_main, inplace=True) # Drop rows where essential OHLC might be NaN
+
+                    if not all(col in main_interval_df.columns for col in required_cols_for_main):
+                        print(f"DataPrep Error: Missing one or more required columns {required_cols_for_main} in resampled data after cleaning.")
+                        return empty_return
+
+                    main_interval_df.set_index('date', inplace=True)
+                    print(f"DataPrep: Prepared 'main_interval_df' ({primary_interval_minutes}-min) with {len(main_interval_df)} rows, index type: {type(main_interval_df.index)}")
+
                 except Exception as e:
-                    print(f"DataPrep Error during resampling to '{interval}' ({target_interval_minutes} mins): {e}")
-                    print("DataPrep Warning: Proceeding with 1-minute data due to resampling error.")
-                    final_df = historical_df_minute
-        else:
-            final_df = historical_df_minute
+                    print(f"DataPrep Error during resampling to '{primary_interval_minutes}' mins: {e}")
+                    print("DataPrep Warning: Returning 1-minute data as 'main_interval_data' due to resampling error.")
+                    main_interval_df = cleaned_one_minute_df.copy() # Fallback
+        else: # primary_interval_minutes is 1 or less
+            print(f"DataPrep: Using 1-minute data as 'main_interval_data' (requested interval: {primary_interval_minutes} min).")
+            main_interval_df = cleaned_one_minute_df.copy()
 
-        # After resampling, check if the datetime column is named 'timestamp'
-        if 'timestamp' in final_df.columns and 'date' not in final_df.columns:
-            print("DataPrep: Found 'timestamp' column after resampling, renaming to 'date'.")
-            final_df.rename(columns={'timestamp': 'date'}, inplace=True)
-        elif 'date' not in final_df.columns:
-            # If neither 'date' nor 'timestamp' is present, then we have an issue.
-            # This also covers the case where the index might be datetime but not named 'date'.
-            # A more robust solution might be needed if dates are in an unnamed index or other column.
-            if isinstance(final_df.index, pd.DatetimeIndex):
-                print("DataPrep: 'date' column not found, but DatetimeIndex is present. Resetting index.")
-                final_df.reset_index(inplace=True)
-                # If the reset index resulted in a column named 'index' or the original index name, try to rename to 'date'
-                if final_df.columns[0] != 'date' : # Assuming date becomes the first column
-                     # Check if the first column (potentially from reset_index) should be 'date'
-                     # This is a simple heuristic. If index was named, it might take that name.
-                    if final_df.index.name and final_df.index.name != 'date' and final_df.index.name in final_df.columns:
-                        final_df.rename(columns={final_df.index.name: 'date'}, inplace=True)
-                    elif 'index' in final_df.columns and 'date' not in final_df.columns: # Common if index was unnamed
-                        final_df.rename(columns={'index': 'date'}, inplace=True)
-                    else: # Fallback if first col is not 'date' yet
-                         print(f"DataPrep: Attempting to rename first column '{final_df.columns[0]}' to 'date' after index reset.")
-                         final_df.rename(columns={final_df.columns[0]: 'date'}, inplace=True)
+        # Final check for main_interval_df
+        if main_interval_df.empty and primary_interval_minutes > 1:
+             print("DataPrep Warning: main_interval_df is empty after attempting resampling. Defaulting to 1-min data for main_interval_df.")
+             main_interval_df = cleaned_one_minute_df.copy()
+        elif main_interval_df.empty and primary_interval_minutes <=1:
+             print("DataPrep Warning: main_interval_df is empty even for 1-min data (should not happen if cleaned_one_minute_df was populated).")
+             # This implies cleaned_one_minute_df might have been empty, handled earlier. If not, it's an issue.
+
+        if not isinstance(main_interval_df.index, pd.DatetimeIndex):
+            print(f"DataPrep Critical Error: 'main_interval_df' index is not DatetimeIndex before returning. Type: {type(main_interval_df.index)}")
+            # Attempt recovery if 'date' column exists
+            if 'date' in main_interval_df.columns:
+                try:
+                    main_interval_df['date'] = pd.to_datetime(main_interval_df['date'])
+                    main_interval_df.set_index('date', inplace=True)
+                    print("DataPrep: Recovered DatetimeIndex for 'main_interval_df'.")
+                except:
+                    return empty_return # Give up
             else:
-                print(f"DataPrep Critical Error: 'date' or 'timestamp' column missing after resampling, and index is not DatetimeIndex. Columns: {final_df.columns.tolist()}, Index type: {type(final_df.index)}")
-                return pd.DataFrame()
-        
-        # Ensure 'date' column is of datetime type after all manipulations
-        if 'date' in final_df.columns:
-            try:
-                final_df['date'] = pd.to_datetime(final_df['date'])
-                print("DataPrep: Ensured 'date' column is pd.to_datetime.")
-            except Exception as e:
-                print(f"DataPrep Critical Error: Failed to convert 'date' column to datetime: {e}. Column content head: {final_df['date'].head()}")
-                return pd.DataFrame()
-        else:
-            print("DataPrep Critical Error: 'date' column still missing before final checks.")
-            return pd.DataFrame()
+                return empty_return
 
-        final_df.reset_index(drop=True, inplace=True) 
-        required_cols = ['date', 'open', 'high', 'low', 'close'] 
-        # Before dropna, ensure all required_cols are actually present after index handling
-        missing_for_dropna = [col for col in required_cols if col not in final_df.columns]
-        if missing_for_dropna:
-            print(f"DataPrep Critical Error: Columns {missing_for_dropna} are missing before dropna.")
-            return pd.DataFrame()
-            
-        final_df.dropna(subset=required_cols, inplace=True) # Drop rows where essential OHLC data might be NaN after resampling
+        if not isinstance(cleaned_one_minute_df.index, pd.DatetimeIndex):
+             print(f"DataPrep Critical Error: 'cleaned_one_minute_df' index is not DatetimeIndex before returning. Type: {type(cleaned_one_minute_df.index)}")
+             # This should have been set, but as a safeguard:
+             if 'date' in cleaned_one_minute_df.reset_index().columns: # Check if 'date' exists as column after reset
+                cleaned_one_minute_df.reset_index(inplace=True)
+                cleaned_one_minute_df['date'] = pd.to_datetime(cleaned_one_minute_df['date'])
+                cleaned_one_minute_df.set_index('date', inplace=True)
+                print("DataPrep: Recovered DatetimeIndex for 'cleaned_one_minute_df'.")
+             else: # Give up
+                return empty_return
 
-        if not all(col in final_df.columns for col in required_cols):
-            print(f"DataPrep Error: Missing one or more required columns {required_cols} after final preparation.")
-            return pd.DataFrame()
 
-        print(f"DataPrep: Data preparation complete for interval '{interval}'. Final shape: {final_df.shape}")
-        return final_df
+        print(f"DataPrep: Data preparation complete. Returning 'main_interval_data' ({len(main_interval_df)} rows) and 'one_minute_data' ({len(cleaned_one_minute_df)} rows).")
+        return {'main_interval_data': main_interval_df, 'one_minute_data': cleaned_one_minute_df}
 
     def calculate_statistics(self, data: pd.DataFrame, **kwargs) -> pd.DataFrame:
         """
@@ -343,17 +379,21 @@ class TradingStrategy(BaseStrategy):
         """
         n = len(data)
         if n < 2:
+            print(f"{self.strategy_name} _calculate_zigzag_pivots: Data length {n} < 2, returning empty list.")
             return []
 
+        print(f"\n{self.strategy_name} _calculate_zigzag_pivots: Starting ZigZag calculation for {n} candles.")
         sz_points_values = pd.Series([np.nan] * n, index=data.index)
         # Pine: _direction = _isUp[1] and _isDown ? -1 : _isDown[1] and _isUp ? 1 : nz(_direction[1])
         # nz(_direction[1]) means if _direction[1] is na, use 0 or last known non-na value.
         # For simplicity, let's track direction explicitly.
         
         pine_direction = 0.0 # 0: undetermined, 1: up, -1: down
+        print(f"{self.strategy_name} _calculate_zigzag_pivots: Initial pine_direction = {pine_direction}")
 
         # Loop starts from index 1 as it uses previous bar data (i-1)
         for i in range(1, n):
+            current_ts = data.index[i]
             # Current candle properties
             open_curr = data['open'].iloc[i]
             close_curr = data['close'].iloc[i]
@@ -361,6 +401,7 @@ class TradingStrategy(BaseStrategy):
             low_curr = data['low'].iloc[i]
             
             # Previous candle properties
+            prev_ts = data.index[i-1]
             open_prev = data['open'].iloc[i-1]
             close_prev = data['close'].iloc[i-1]
             high_prev = data['high'].iloc[i-1]
@@ -377,11 +418,22 @@ class TradingStrategy(BaseStrategy):
             # nz(_direction[1]) means use previous direction if no change pattern.
             prev_pine_direction_for_calc = pine_direction # This is nz(direction[1]) equivalent
             
+            log_prefix = f"{self.strategy_name} ZZ Log @ {current_ts} (Prev: {prev_ts}):"
+            print(f"{log_prefix} Prev C: O:{open_prev:.2f} H:{high_prev:.2f} L:{low_prev:.2f} C:{close_prev:.2f} | Curr C: O:{open_curr:.2f} H:{high_curr:.2f} L:{low_curr:.2f} C:{close_curr:.2f}")
+            print(f"{log_prefix} isUp_prev={isUp_prev}, isDown_prev={isDown_prev}, isUp_curr={isUp_curr}, isDown_curr={isDown_curr}")
+            print(f"{log_prefix} prev_pine_direction_for_calc = {prev_pine_direction_for_calc}")
+
             if isUp_prev and isDown_curr:
                 pine_direction = -1
+                print(f"{log_prefix} Condition (isUp_prev and isDown_curr) met. New pine_direction = -1")
             elif isDown_prev and isUp_curr:
                 pine_direction = 1
-            # else: pine_direction remains its previous value (effect of nz)
+                print(f"{log_prefix} Condition (isDown_prev and isUp_curr) met. New pine_direction = 1")
+            else:
+                print(f"{log_prefix} No direction change condition met. pine_direction remains {pine_direction}")
+            
+            print(f"{log_prefix} Updated pine_direction_for_current_eval = {pine_direction}")
+
 
             # Zigzag point logic from Pine:
             # _zigzag = _isUp[1] and _isDown and _direction[1] != -1 ? highest(2) : 
@@ -390,11 +442,23 @@ class TradingStrategy(BaseStrategy):
             # So, we use prev_pine_direction_for_calc.
             # highest(2) means max(high_curr, high_prev), lowest(2) means min(low_curr, low_prev)
 
+            pivot_found_type = "None"
             if isUp_prev and isDown_curr and prev_pine_direction_for_calc != -1:
-                sz_points_values.iloc[i] = max(high_curr, high_prev)
+                pivot_price = max(high_curr, high_prev)
+                sz_points_values.iloc[i] = pivot_price
+                pivot_found_type = f"High Pivot ({pivot_price:.2f})"
+                print(f"{log_prefix} HIGH PIVOT condition (isUp_prev and isDown_curr and prev_pine_direction_for_calc != -1) MET. Pivot at {pivot_price:.2f}")
             elif isDown_prev and isUp_curr and prev_pine_direction_for_calc != 1:
-                sz_points_values.iloc[i] = min(low_curr, low_prev)
-        
+                pivot_price = min(low_curr, low_prev)
+                sz_points_values.iloc[i] = pivot_price
+                pivot_found_type = f"Low Pivot ({pivot_price:.2f})"
+                print(f"{log_prefix} LOW PIVOT condition (isDown_prev and isUp_curr and prev_pine_direction_for_calc != 1) MET. Pivot at {pivot_price:.2f}")
+            else:
+                print(f"{log_prefix} NO PIVOT condition met this candle.")
+                print(f"{log_prefix}   Checked High: isUp_prev={isUp_prev}, isDown_curr={isDown_curr}, prev_pine_direction_for_calc={prev_pine_direction_for_calc} (need all true and last != -1)")
+                print(f"{log_prefix}   Checked Low:  isDown_prev={isDown_prev}, isUp_curr={isUp_curr}, prev_pine_direction_for_calc={prev_pine_direction_for_calc} (need all true and last != 1)")
+            
+        print(f"\n{self.strategy_name} _calculate_zigzag_pivots: Finished ZigZag calculation.")
         # Extract non-NaN pivots
         actual_pivots = []
         for idx_val, price in sz_points_values.items(): # idx_val is the timestamp
@@ -537,8 +601,35 @@ class TradingStrategy(BaseStrategy):
         else: # Bearish pattern, D is a high, C is a low (d_price > c_price usually)
             return d_price - (fib_range * rate)
 
-    def generate_signals(self, data: pd.DataFrame) -> pd.DataFrame:
-        df = data.copy()
+    def generate_signals(self, data_input_dict: dict) -> pd.DataFrame:
+        """
+        Generates trading signals based on the input data dictionary.
+
+        Args:
+            data_input_dict: A dictionary containing two pandas DataFrames:
+                             {'main_interval_data': DataFrame at the target primary_interval_minutes for strategy operation,
+                              'one_minute_data': DataFrame with cleaned 1-minute data for potential altTF resampling}.
+                             Both DataFrames must have a 'date' column as DatetimeIndex, and OHLCV columns.
+
+        Returns:
+            DataFrame (based on main_interval_data.index) with an added 'signal' column.
+            Signal values: 1 for BUY, -1 for SELL/EXIT, 0 for HOLD/NO_SIGNAL.
+            May also include intermediate indicator columns used by the strategy.
+        """
+        if not isinstance(data_input_dict, dict) or \
+           'main_interval_data' not in data_input_dict or \
+           'one_minute_data' not in data_input_dict:
+            print(f"{self.strategy_name}: Invalid input to generate_signals. Expected dict with 'main_interval_data' and 'one_minute_data'.")
+            # Return an empty DataFrame with expected columns if possible, or just empty
+            return pd.DataFrame(columns=['signal', 'pattern_tag'])
+
+        df = data_input_dict['main_interval_data'].copy()
+        one_minute_data_for_alttf = data_input_dict['one_minute_data'].copy() # For alt TF resampling
+        
+        if df.empty:
+            print(f"{self.strategy_name}: 'main_interval_data' is empty. Cannot generate signals.")
+            return pd.DataFrame(columns=['signal', 'pattern_tag'])
+
         df['signal'] = 0
         df['pattern_tag'] = ""
         df['zigzag_price'] = np.nan
@@ -587,59 +678,68 @@ class TradingStrategy(BaseStrategy):
             return df
 
         # --- Prepare data for ZigZag calculation (potentially resampled) ---
-        data_for_zigzag = df.copy() # Default to original (1-min) data
-        if self.useAltTF and self.altTF_interval_minutes > 1:
-            print(f"{self.strategy_name}: Resampling 1-minute data to {self.altTF_interval_minutes}-minute for ZigZag calculation using k_apis.")
-            # Ensure the df passed to convert_minute_data_interval has 'instrument_token' if required by that function
-            # The function in myKiteLib.py groups by instrument_token.
-            # If df comes from DataPrep.fetch_and_prepare_data, it might not have instrument_token if fetched for single token.
-            # Let's assume fetch_and_prepare_data (or the test data in __main__) provides it or adapt.
-            # For __main__ test data, we might need to add it if it was single token.
-            # However, `convert_minute_data_interval` in `myKiteLib.py` adds it back if missing after grouping.
-            # The primary input `df` for `generate_signals` should be the raw 1-min data.
-            # `convert_minute_data_interval` expects 'timestamp' and 'instrument_token' columns.
-            # `DataPrep.fetch_and_prepare_data` result `ohlcv_data` is indexed by 'date'. 
-            # In __main__, we do ohlcv_data.set_index('date').
-            # So, before passing to convert_minute_data_interval, ensure it's in expected format.
+        data_for_zigzag = pd.DataFrame() # Initialize
+        
+        current_main_interval_approx_minutes = 0
+        if len(df.index) > 1:
+            # Calculate the approximate interval of df from its index
+            time_diffs = (df.index[1:] - df.index[:-1]).to_series()
+            if not time_diffs.empty:
+                median_diff_seconds = time_diffs.median().total_seconds()
+                if median_diff_seconds > 0:
+                    current_main_interval_approx_minutes = median_diff_seconds / 60
+        elif len(df.index) == 1 and df.index[0].hour == 0 and df.index[0].minute == 0: # Daily data might have 1 row
+             current_main_interval_approx_minutes = 1440 # Assume daily if only one entry at midnight
+        
+        print(f"{self.strategy_name}: Main data 'df' has an approximate interval of {current_main_interval_approx_minutes:.2f} minutes.")
 
-            # df is 1-min data, indexed by DatetimeIndex (timestamp/date).
-            # k_apis.convert_minute_data_interval expects 'timestamp' column and 'instrument_token'.
-            # Let's prepare a temporary df for resampling to match expectations if needed.
-            df_for_resample_input = df.reset_index() # 'date' or 'index' becomes a column
-            if 'date' in df_for_resample_input.columns and 'timestamp' not in df_for_resample_input.columns:
-                df_for_resample_input.rename(columns={'date': 'timestamp'}, inplace=True)
-            elif 'index' in df_for_resample_input.columns and 'timestamp' not in df_for_resample_input.columns: # if index was unnamed
-                 df_for_resample_input.rename(columns={'index': 'timestamp'}, inplace=True)
+        if self.useAltTF and self.altTF_interval_minutes > 0 and abs(self.altTF_interval_minutes - current_main_interval_approx_minutes) > 1e-2: # Check if altTF is meaningfully different
+            print(f"{self.strategy_name}: Using alternate timeframe. Resampling 1-minute data to {self.altTF_interval_minutes}-minute for ZigZag calculation.")
             
-            # Add instrument_token if not present (e.g. for single token data from DataPrep)
-            # This relies on self.instrument_token being set, e.g. from config by simulator.
-            # For testing, it needs to be available if convert_minute_data_interval strictly needs it.
-            # The myKiteLib version seems to handle it if a single group of data is passed.
-            # For safety, let's ensure it's there if we have a known token for the df.
-            if 'instrument_token' not in df_for_resample_input.columns and hasattr(self, 'instrument_token') and self.instrument_token is not None:
-                 df_for_resample_input['instrument_token'] = self.instrument_token
-            elif 'instrument_token' not in df_for_resample_input.columns:
-                # If instrument_token is critical for convert_minute_data_interval for grouping,
-                # and not available, this might be an issue. The sample data in __main__ is single token.
-                # Let's add a dummy one for now if missing, assuming single series data.
-                # This part is a bit of a workaround if the strategy is only ever given single-token data.
-                # The myKiteLib function implies it can handle data for multiple tokens.
-                print(f"{self.strategy_name}: Warning - 'instrument_token' column missing for resampling. Adding dummy token 0.")
-                df_for_resample_input['instrument_token'] = 0 
-
-            resampled_data = self.k_apis.convert_minute_data_interval(df_for_resample_input, to_interval=self.altTF_interval_minutes)
-            
-            if resampled_data is not None and not resampled_data.empty:
-                # convert_minute_data_interval returns df with 'timestamp' column. Set it as index for _calculate_zigzag_pivots.
-                if 'timestamp' in resampled_data.columns:
-                    resampled_data['timestamp'] = pd.to_datetime(resampled_data['timestamp'])
-                    data_for_zigzag = resampled_data.set_index('timestamp')
-                else:
-                    print(f"{self.strategy_name}: Warning - Resampled data missing 'timestamp' column. Using 1-minute data for ZigZag.")
+            if one_minute_data_for_alttf.empty:
+                print(f"{self.strategy_name}: Warning - 'one_minute_data' is empty, cannot resample for altTF. Falling back to main interval data for ZigZag.")
+                data_for_zigzag = df.copy() # Fallback
             else:
-                print(f"{self.strategy_name}: Warning - Resampled data empty after convert_minute_data_interval. Using 1-minute data for ZigZag.")
+                # Prepare one_minute_data_for_alttf for resampling (expects 'timestamp' and 'instrument_token')
+                df_for_resample_input = one_minute_data_for_alttf.reset_index() # 'date' becomes a column
+                if 'date' in df_for_resample_input.columns and 'timestamp' not in df_for_resample_input.columns:
+                    df_for_resample_input.rename(columns={'date': 'timestamp'}, inplace=True)
+                elif 'index' in df_for_resample_input.columns and 'timestamp' not in df_for_resample_input.columns:
+                    df_for_resample_input.rename(columns={'index': 'timestamp'}, inplace=True)
+                
+                if 'instrument_token' not in df_for_resample_input.columns and hasattr(self, 'instrument_token') and self.instrument_token is not None:
+                    df_for_resample_input['instrument_token'] = self.instrument_token
+                elif 'instrument_token' not in df_for_resample_input.columns:
+                    print(f"{self.strategy_name}: Warning - 'instrument_token' column missing for altTF resampling. Adding dummy token 0.")
+                    df_for_resample_input['instrument_token'] = 0 
+
+                if not hasattr(self.k_apis, 'convert_minute_data_interval'):
+                    print(f"{self.strategy_name}: Error - kiteAPIs object does not have method 'convert_minute_data_interval'. Cannot resample for altTF. Falling back.")
+                    data_for_zigzag = df.copy()
+                else:
+                    resampled_alt_tf_data = self.k_apis.convert_minute_data_interval(df_for_resample_input, to_interval=self.altTF_interval_minutes)
+                    
+                    if resampled_alt_tf_data is not None and not resampled_alt_tf_data.empty:
+                        if 'timestamp' in resampled_alt_tf_data.columns:
+                            resampled_alt_tf_data['timestamp'] = pd.to_datetime(resampled_alt_tf_data['timestamp'])
+                            data_for_zigzag = resampled_alt_tf_data.set_index('timestamp')
+                            print(f"{self.strategy_name}: Successfully prepared altTF data for ZigZag ({len(data_for_zigzag)} rows).")
+                        else:
+                            print(f"{self.strategy_name}: Warning - Resampled altTF data missing 'timestamp' column. Using main interval data for ZigZag.")
+                            data_for_zigzag = df.copy()
+                    else:
+                        print(f"{self.strategy_name}: Warning - Resampled altTF data empty. Using main interval data for ZigZag.")
+                        data_for_zigzag = df.copy()
         else:
-            data_for_zigzag = df
+            if self.useAltTF and self.altTF_interval_minutes > 0:
+                 print(f"{self.strategy_name}: AltTF ({self.altTF_interval_minutes} min) is same as or very close to main data interval ({current_main_interval_approx_minutes:.2f} min). Using main data for ZigZag.")
+            else:
+                 print(f"{self.strategy_name}: Not using AltTF or altTF_interval_minutes is invalid. Using main data interval for ZigZag calculation.")
+            data_for_zigzag = df.copy()
+
+        if data_for_zigzag.empty:
+            print(f"{self.strategy_name}: Critical - data_for_zigzag is empty before pivot calculation. Cannot proceed.")
+            return df # or an empty df with signal column
 
         # Calculate all ZigZag pivots once on the (potentially resampled) dataset
         all_zz_pivots_timed = self._calculate_zigzag_pivots(data_for_zigzag) 
@@ -1170,35 +1270,42 @@ if __name__ == '__main__':
         print(f"Effective simulation period for this test run: {sim_start_date} to {sim_end_date}")
         print(f"Effective warm-up days: {warm_up_period_days}")
 
-        base_data_interval_str = 'minute' 
-        print(f"Attempting to fetch 1-MINUTE data for token {test_token} from {sim_start_date} to {sim_end_date} with {warm_up_period_days} warm-up days...")
+        # Define the primary interval for this test run (e.g., 5 minutes)
+        # This would typically be one of the values your wrapper would loop through.
+        test_primary_interval_minutes = int(strategy_params_from_config.get('primary_interval_for_main_test', 5)) 
+        print(f"Using primary interval for this test: {test_primary_interval_minutes} minutes")
         
-        ohlcv_data_1min = dp.fetch_and_prepare_data(
+        # altTF_interval_minutes for TradingStrategy will be set from strategy_params_from_config
+        # The 'usealttf' flag will also come from there.
+
+        print(f"Attempting to fetch data for token {test_token} from {sim_start_date} to {sim_end_date} with {warm_up_period_days} warm-up days, target main interval {test_primary_interval_minutes} min...")
+        
+        # Fetch data using the updated DataPrep method
+        data_dict = dp.fetch_and_prepare_data(
             instrument_token=test_token,
             start_date_obj=sim_start_date, 
             end_date_obj=sim_end_date,
-            interval=base_data_interval_str, 
+            primary_interval_minutes=test_primary_interval_minutes, 
             warm_up_days=warm_up_period_days
         )
 
-        if ohlcv_data_1min is not None and not ohlcv_data_1min.empty:
-            print(f"Fetched data (including warm-up) for {test_token}: {ohlcv_data_1min.shape}")
+        if data_dict and not data_dict['main_interval_data'].empty:
+            print(f"Fetched main interval data ({test_primary_interval_minutes}-min) for {test_token}: {data_dict['main_interval_data'].shape}")
+            print(f"Fetched one_minute_data for {test_token}: {data_dict['one_minute_data'].shape}")
             
-            if 'date' in ohlcv_data_1min.columns:
-                ohlcv_data_1min['date'] = pd.to_datetime(ohlcv_data_1min['date'])
-                ohlcv_data_1min.set_index('date', inplace=True)
-                print("Set 'date' column as DatetimeIndex for the 1-minute data.")
-            else:
-                print("Error: 'date' column missing in 1-minute data to set as index.")
+            # 'date' column should already be DatetimeIndex from fetch_and_prepare_data
+            # No need to set index again here if DataPrep ensures it.
 
             strategy_instance = TradingStrategy(
                 kite_apis_instance=dp.k_apis, 
                 simulation_actual_start_date=sim_start_date, 
-                **strategy_params_from_config
+                # strategy_params_from_config will pass 'alttf_interval_minutes' and 'usealttf'
+                **strategy_params_from_config 
             )
             
-            print("\nRunning generate_signals with 1-minute data (including warm-up)...")
-            visualization_df = strategy_instance.generate_signals(ohlcv_data_1min.copy()) 
+            print(f"\nRunning generate_signals with {test_primary_interval_minutes}-minute main data (warm-up included in fetched range)...")
+            # Pass the dictionary to generate_signals
+            visualization_df = strategy_instance.generate_signals(data_input_dict=data_dict) 
             
             print("\n--- DataFrame with Signals (Sample) ---")
             print(visualization_df[['signal', 'pattern_tag', 'close']].head(3)) # Show relevant columns, reduced sample
