@@ -1,0 +1,12 @@
+# Live Trader Cron Jobs
+# Start live trader at 9:10 AM Monday to Friday
+10 9 * * 1-5 /Users/shashankbaveja/Main/Projects/KiteConnectAPI/trading_setup\ ZigZag/start_live_trader.sh
+
+# Stop live trader at 3:40 PM Monday to Friday  
+40 15 * * 1-5 /Users/shashankbaveja/Main/Projects/KiteConnectAPI/trading_setup\ ZigZag/stop_live_trader.sh
+
+# Run data backfill at 3:40 PM every day (including weekends for any missed data)
+40 15 * * * /Users/shashankbaveja/Main/Projects/KiteConnectAPI/trading_setup\ ZigZag/run_data_backfill.sh
+
+# Cleanup old logs every Sunday at 2 AM (keep last 30 days)
+0 2 * * 0 find /Users/shashankbaveja/Main/Projects/KiteConnectAPI/trading_setup\ ZigZag/logs -name "*.log" -mtime +30 -delete 

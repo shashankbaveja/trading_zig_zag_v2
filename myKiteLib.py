@@ -490,15 +490,26 @@ class kiteAPIs:
         # Sort by instrument_token and timestamp
         df = df.sort_values(by=['instrument_token', 'timestamp'])
 
-        agg_rules = {
+        # Define base aggregation rules - only use columns that exist
+        base_agg_rules = {
             'open': 'first',
             'high': 'max',
             'low': 'min',
             'close': 'last',
-            'volume': 'sum',
-            'id': 'first', 
-            'strike': 'first' 
+            'volume': 'sum'
         }
+        
+        # Add optional columns if they exist
+        optional_columns = {
+            'id': 'first',
+            'strike': 'first'
+        }
+        
+        # Build final aggregation rules based on available columns
+        agg_rules = base_agg_rules.copy()
+        for col, agg_func in optional_columns.items():
+            if col in df.columns:
+                agg_rules[col] = agg_func
 
         all_resampled_dfs = []
 
@@ -540,19 +551,24 @@ class kiteAPIs:
         final_df = pd.concat(all_resampled_dfs)
         final_df = final_df.reset_index() # 'timestamp' becomes a column
 
-        # Ensure final column order as per requirement
-        # Desired order: ID, instrument_token, open, high, low, close, volume, strike, timestamp
-        # Current columns likely: timestamp, open, high, low, close, volume, ID, strike, instrument_token
-        
         # Define desired column order
         # (Make sure all these columns exist in final_df after aggregation and reset_index)
         # 'instrument_token' added above, 'timestamp' from reset_index
-        desired_columns = ['ID', 'instrument_token', 'open', 'high', 'low', 'close', 'volume', 'strike', 'timestamp']
+        base_desired_columns = ['instrument_token', 'open', 'high', 'low', 'close', 'volume', 'timestamp']
+        optional_desired_columns = ['ID', 'id', 'strike']
         
-        # Filter out any columns that might not be present if original df was minimal
-        # And reorder
-        final_df_columns = [col for col in desired_columns if col in final_df.columns]
-        final_df = final_df[final_df_columns]
+        # Build final desired columns list based on what exists
+        desired_columns = []
+        for col in base_desired_columns:
+            if col in final_df.columns:
+                desired_columns.append(col)
+        
+        for col in optional_desired_columns:
+            if col in final_df.columns:
+                desired_columns.append(col)
+        
+        # Filter and reorder
+        final_df = final_df[desired_columns]
         
         return final_df
 

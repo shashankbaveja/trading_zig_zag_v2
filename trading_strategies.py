@@ -309,7 +309,7 @@ class TradingStrategy(BaseStrategy):
         self.target02_sl_rate = float(kwargs.get('target02_sl_rate', -0.236))
 
         self.useAltTF = str(kwargs.get('usealttf', 'true')).lower() == 'true' # Adjusted key to lowercase
-        self.altTF_interval_minutes = int(kwargs.get('alttf_interval_minutes', 60)) # Adjusted key to lowercase
+        self.altTF_interval_minutes = int(kwargs.get('alttf_interval_minutes', 10)) # Adjusted key to lowercase
 
         # Allow other kwargs (like instrument_token) to be set as attributes
         # and remove strategy-specific ones already processed to avoid overwriting with string versions
@@ -379,17 +379,14 @@ class TradingStrategy(BaseStrategy):
         """
         n = len(data)
         if n < 2:
-            print(f"{self.strategy_name} _calculate_zigzag_pivots: Data length {n} < 2, returning empty list.")
             return []
 
-        print(f"\n{self.strategy_name} _calculate_zigzag_pivots: Starting ZigZag calculation for {n} candles.")
         sz_points_values = pd.Series([np.nan] * n, index=data.index)
         # Pine: _direction = _isUp[1] and _isDown ? -1 : _isDown[1] and _isUp ? 1 : nz(_direction[1])
         # nz(_direction[1]) means if _direction[1] is na, use 0 or last known non-na value.
         # For simplicity, let's track direction explicitly.
         
         pine_direction = 0.0 # 0: undetermined, 1: up, -1: down
-        print(f"{self.strategy_name} _calculate_zigzag_pivots: Initial pine_direction = {pine_direction}")
 
         # Loop starts from index 1 as it uses previous bar data (i-1)
         for i in range(1, n):
@@ -418,22 +415,10 @@ class TradingStrategy(BaseStrategy):
             # nz(_direction[1]) means use previous direction if no change pattern.
             prev_pine_direction_for_calc = pine_direction # This is nz(direction[1]) equivalent
             
-            log_prefix = f"{self.strategy_name} ZZ Log @ {current_ts} (Prev: {prev_ts}):"
-            print(f"{log_prefix} Prev C: O:{open_prev:.2f} H:{high_prev:.2f} L:{low_prev:.2f} C:{close_prev:.2f} | Curr C: O:{open_curr:.2f} H:{high_curr:.2f} L:{low_curr:.2f} C:{close_curr:.2f}")
-            print(f"{log_prefix} isUp_prev={isUp_prev}, isDown_prev={isDown_prev}, isUp_curr={isUp_curr}, isDown_curr={isDown_curr}")
-            print(f"{log_prefix} prev_pine_direction_for_calc = {prev_pine_direction_for_calc}")
-
             if isUp_prev and isDown_curr:
                 pine_direction = -1
-                print(f"{log_prefix} Condition (isUp_prev and isDown_curr) met. New pine_direction = -1")
             elif isDown_prev and isUp_curr:
                 pine_direction = 1
-                print(f"{log_prefix} Condition (isDown_prev and isUp_curr) met. New pine_direction = 1")
-            else:
-                print(f"{log_prefix} No direction change condition met. pine_direction remains {pine_direction}")
-            
-            print(f"{log_prefix} Updated pine_direction_for_current_eval = {pine_direction}")
-
 
             # Zigzag point logic from Pine:
             # _zigzag = _isUp[1] and _isDown and _direction[1] != -1 ? highest(2) : 
@@ -442,23 +427,15 @@ class TradingStrategy(BaseStrategy):
             # So, we use prev_pine_direction_for_calc.
             # highest(2) means max(high_curr, high_prev), lowest(2) means min(low_curr, low_prev)
 
-            pivot_found_type = "None"
             if isUp_prev and isDown_curr and prev_pine_direction_for_calc != -1:
                 pivot_price = max(high_curr, high_prev)
                 sz_points_values.iloc[i] = pivot_price
-                pivot_found_type = f"High Pivot ({pivot_price:.2f})"
-                print(f"{log_prefix} HIGH PIVOT condition (isUp_prev and isDown_curr and prev_pine_direction_for_calc != -1) MET. Pivot at {pivot_price:.2f}")
+                print(f"PIVOT DETECTED: HIGH at {current_ts} - Price: {pivot_price:.2f}")
             elif isDown_prev and isUp_curr and prev_pine_direction_for_calc != 1:
                 pivot_price = min(low_curr, low_prev)
                 sz_points_values.iloc[i] = pivot_price
-                pivot_found_type = f"Low Pivot ({pivot_price:.2f})"
-                print(f"{log_prefix} LOW PIVOT condition (isDown_prev and isUp_curr and prev_pine_direction_for_calc != 1) MET. Pivot at {pivot_price:.2f}")
-            else:
-                print(f"{log_prefix} NO PIVOT condition met this candle.")
-                print(f"{log_prefix}   Checked High: isUp_prev={isUp_prev}, isDown_curr={isDown_curr}, prev_pine_direction_for_calc={prev_pine_direction_for_calc} (need all true and last != -1)")
-                print(f"{log_prefix}   Checked Low:  isDown_prev={isDown_prev}, isUp_curr={isUp_curr}, prev_pine_direction_for_calc={prev_pine_direction_for_calc} (need all true and last != 1)")
+                print(f"PIVOT DETECTED: LOW at {current_ts} - Price: {pivot_price:.2f}")
             
-        print(f"\n{self.strategy_name} _calculate_zigzag_pivots: Finished ZigZag calculation.")
         # Extract non-NaN pivots
         actual_pivots = []
         for idx_val, price in sz_points_values.items(): # idx_val is the timestamp
@@ -1272,7 +1249,7 @@ if __name__ == '__main__':
 
         # Define the primary interval for this test run (e.g., 5 minutes)
         # This would typically be one of the values your wrapper would loop through.
-        test_primary_interval_minutes = int(strategy_params_from_config.get('primary_interval_for_main_test', 5)) 
+        test_primary_interval_minutes = int(strategy_params_from_config.get('primary_interval_for_main_test', 1)) 
         print(f"Using primary interval for this test: {test_primary_interval_minutes} minutes")
         
         # altTF_interval_minutes for TradingStrategy will be set from strategy_params_from_config
