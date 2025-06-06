@@ -32,6 +32,13 @@ class LiveTrader:
         self._setup_logging()
         self.logger.info("--- LiveTrader (ZigZag Harmonic) Initializing ---")
 
+        # Set up a dedicated logger for live trader actions
+        self.action_logger = logging.getLogger('live_trader_actions')
+        self.action_logger.setLevel(logging.INFO)
+        action_handler = logging.FileHandler('logs/live_trader_actions.log', mode='w')
+        action_handler.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
+        self.action_logger.addHandler(action_handler)
+
         # Initialize core components
         try:
             self.order_manager = OrderPlacement()
@@ -302,60 +309,83 @@ class LiveTrader:
             return None
 
     def _execute_trades(self, signal_data):
-        """Execute trades based on signals"""
+        """
+        Execute trades based on the latest signal, but only if it's recent.
+        This function checks only the most recent signal and acts if it's within a 5-minute window.
+        """
         try:
-            latest_signal = signal_data['latest_signal']
-            latest_row = signal_data['latest_row']
-            current_timestamp = signal_data['latest_timestamp']
-            
-            # Check if this is a new signal (avoid duplicate trades)
-            if self.last_signal_timestamp == current_timestamp:
+            signals_df = signal_data.get('signals_df')
+            if signals_df is None or signals_df.empty:
+                return
+
+            # Filter for all rows with a non-zero signal
+            signals_with_action = signals_df[signals_df['signal'] != 0]
+
+            if signals_with_action.empty:
+                self.logger.debug("No signals with action found in the latest data.")
+                return
+
+            # Get the single most recent signal
+            last_signal_row = signals_with_action.iloc[-1]
+            last_signal_timestamp = signals_with_action.index[-1]
+
+            # Avoid re-processing the same signal on subsequent ticks
+            if self.last_signal_timestamp and self.last_signal_timestamp == last_signal_timestamp:
+                self.logger.debug(f"Signal at {last_signal_timestamp} has already been considered. Skipping.")
+                return
+
+            # Check if the signal is too old to act upon
+            current_time = pd.Timestamp.now(tz=last_signal_timestamp.tzinfo)
+            time_difference = current_time - last_signal_timestamp
+
+            if time_difference > timedelta(minutes=5):
+                self.logger.warning(f"IGNORING STALE SIGNAL from {last_signal_timestamp} "
+                                  f"({time_difference.total_seconds() / 60:.2f} mins ago). Current time: {current_time}")
+                self.last_signal_timestamp = last_signal_timestamp  # Mark as considered
                 return
             
-            # Send telegram notification for ANY signal generation (±1)
-            if latest_signal == 1 or latest_signal == -1:
-                current_price = latest_row['close']
-                pattern_tag = latest_row.get('pattern_tag', '')
-                
-                signal_type_text = "BUY SIGNAL" if latest_signal == 1 else "SELL/EXIT SIGNAL"
-                
-                self.order_manager.send_telegram_message(
-                    f"🔔 SIGNAL GENERATED 🔔\n"
-                    f"Type: {signal_type_text} ({latest_signal:+d})\n"
-                    f"Price: {current_price:.2f}\n"
-                    f"Pattern: {pattern_tag[:50]}...\n"  # Truncate long pattern tags
-                    f"Time: {current_timestamp.strftime('%H:%M:%S')}"
-                )
-                
-                self.logger.info(f"Signal notification sent: {signal_type_text} at {current_price:.2f}")
+            # If we reach here, the signal is fresh and new. Process it.
+            self.logger.info(f"Processing fresh signal from {last_signal_timestamp} ({time_difference.total_seconds():.2f}s old).")
             
-            # Process EXIT signals for active trades
-            if latest_signal == -1 and self.is_any_trade_active:
-                pattern_tag = latest_row.get('pattern_tag', '')
-                current_price = latest_row['close']
-                
-                # Exit all active trades when strategy gives exit signal
-                trades_to_close = list(self.active_trades.keys())
-                for trade_id in trades_to_close:
-                    trade_details = self.active_trades[trade_id]
-                    if trade_details['status'] == 'ACTIVE':
-                        self._close_trade(trade_details, current_price, f"STRATEGY_EXIT_SIGNAL: {pattern_tag}")
+            signal = last_signal_row['signal']
+            pattern_tag = last_signal_row.get('pattern_tag', '')
+            current_price = last_signal_row['close']
+            
+            # Send Telegram notification for the fresh signal
+            signal_type_text = "BUY/ENTRY SIGNAL" if signal == 1 else "SELL/EXIT SIGNAL"
+            self.order_manager.send_telegram_message(
+                f"🔔 FRESH STRATEGY SIGNAL 🔔\n"
+                f"Type: {signal_type_text} ({signal:+d})\n"
+                f"Price: {current_price:.2f}\n"
+                f"Pattern: {pattern_tag[:70]}...\n"
+                f"Time: {last_signal_timestamp.strftime('%H:%M:%S')}"
+            )
+            self.logger.info(f"Telegram notification sent for fresh signal: {signal_type_text} at {current_price:.2f}")
+
+            # Process EXIT signals
+            if signal == -1 and self.is_any_trade_active:
+                trades_to_close_ids = list(self.active_trades.keys())
+                closed_count = 0
+                for trade_id in trades_to_close_ids:
+                    trade_details = self.active_trades.get(trade_id)
+                    if trade_details and trade_details.get('status') in ['ACTIVE', 'PENDING_CONFIRMATION']:
+                        self.logger.info(f"Exit signal received for trade {trade_id} with status {trade_details.get('status')}. Closing it.")
+                        self._close_trade(trade_details, current_price, f"STRATEGY_EXIT: {pattern_tag}")
                         del self.active_trades[trade_id]
+                        closed_count += 1
                 
-                # Update active trade status
                 self.is_any_trade_active = len(self.active_trades) > 0
-                
-                self.logger.info(f"Strategy exit signal processed. Closed {len(trades_to_close)} trades at {current_price:.2f}")
-            
-            # Process BUY signals
-            elif latest_signal == 1 and not self.is_any_trade_active:
-                pattern_tag = latest_row.get('pattern_tag', '')
+                if closed_count > 0:
+                    self.logger.info(f"Strategy exit signal processed. Closed {closed_count} trades at {current_price:.2f}")
+
+            # Process ENTRY signals
+            elif signal == 1 and not self.is_any_trade_active:
                 if 'entry' in pattern_tag.lower():
-                    self._initiate_new_trade(latest_row, current_timestamp, pattern_tag)
+                    self._initiate_new_trade(last_signal_row, last_signal_timestamp, pattern_tag)
             
-            # Update last signal timestamp
-            self.last_signal_timestamp = current_timestamp
-            
+            # Mark this signal as processed
+            self.last_signal_timestamp = last_signal_timestamp
+
         except Exception as e:
             self.logger.error(f"Error in _execute_trades: {e}", exc_info=True)
 
@@ -435,6 +465,10 @@ class LiveTrader:
                 'pattern_tag': pattern_tag
             }
             
+            # Log the action
+            log_message = f"{timestamp} {trade_direction:<4} | ENTRY: {pattern_tag} at {current_price:.2f}"
+            self.action_logger.info(log_message)
+
             self.active_trades[trade_id] = trade_details
             self.is_any_trade_active = True
             self.trade_count_today += 1
@@ -453,6 +487,12 @@ class LiveTrader:
             current_time = datetime.now()
             trades_to_close = []
             
+            # Fetch the latest candle data once for this monitoring cycle
+            latest_candle = self._get_latest_candle_data()
+            if latest_candle is None:
+                self.logger.warning("Could not get latest candle data for monitoring positions.")
+                return
+
             for trade_id, trade_details in self.active_trades.items():
                 try:
                     # Check trade status and update if needed
@@ -463,16 +503,12 @@ class LiveTrader:
                     if trade_details['status'] != 'ACTIVE':
                         continue
                     
-                    # Get current market price
-                    current_price = self._get_current_price()
-                    if current_price is None:
-                        continue
-                    
-                    # Check exit conditions (strategy-based only)
-                    exit_reason = self._check_exit_conditions(trade_details, current_price, current_time)
+                    # Check exit conditions using the full candle data
+                    exit_reason = self._check_exit_conditions(trade_details, latest_candle, current_time)
                     
                     if exit_reason:
-                        self._close_trade(trade_details, current_price, exit_reason)
+                        # Use the close of the candle for the exit price record
+                        self._close_trade(trade_details, latest_candle['close'], exit_reason)
                         trades_to_close.append(trade_id)
                         
                 except Exception as e:
@@ -519,11 +555,9 @@ class LiveTrader:
         except Exception as e:
             self.logger.error(f"Error checking order confirmation: {e}", exc_info=True)
 
-    def _get_current_price(self):
-        """Get current price for the signal instrument"""
+    def _get_latest_candle_data(self):
+        """Get the latest full candle data (OHLC) for the signal instrument."""
         try:
-            # For simplicity, get latest price from historical data
-            # In production, you might want to use live price feeds
             today_str = date.today().strftime('%Y-%m-%d')
             price_data = self.order_manager.kite.historical_data(
                 instrument_token=self.signal_token,
@@ -533,37 +567,36 @@ class LiveTrader:
             )
             
             if price_data and len(price_data) > 0:
-                return price_data[-1]['close']
+                # Returns the last dictionary in the list, which contains ohlc
+                return price_data[-1]
             
             return None
             
         except Exception as e:
-            self.logger.error(f"Error getting current price: {e}", exc_info=True)
+            self.logger.error(f"Error getting latest candle data: {e}", exc_info=True)
             return None
 
-    def _check_exit_conditions(self, trade_details, current_price, current_time):
-        """Check if any exit conditions are met (strategy-based only)"""
+    def _check_exit_conditions(self, trade_details, latest_candle, current_time):
+        """Check if any exit conditions are met using full candle data."""
         try:
             direction = trade_details['direction']
-            entry_price = trade_details['entry_price']
             tp_price = trade_details['tp_price']
             sl_price = trade_details['sl_price']
             
-            # Check TP/SL conditions based on direction
-            if direction == 'LONG':
-                if not pd.isna(tp_price) and current_price >= tp_price:
-                    return 'TARGET_PROFIT'
-                elif not pd.isna(sl_price) and current_price <= sl_price:
-                    return 'STOP_LOSS'
-            else:  # SHORT
-                if not pd.isna(tp_price) and current_price <= tp_price:
-                    return 'TARGET_PROFIT'
-                elif not pd.isna(sl_price) and current_price >= sl_price:
-                    return 'STOP_LOSS'
+            high_price = latest_candle['high']
+            low_price = latest_candle['low']
             
-            # TODO: Add strategy exit signal detection here
-            # This would require checking latest signals from strategy for exit signals
-            # For now, we rely on TP/SL only
+            # Check TP/SL conditions based on direction using high/low
+            if direction == 'LONG':
+                if not pd.isna(tp_price) and high_price >= tp_price:
+                    return f"TP_MONITOR(H>={tp_price:.2f})"
+                elif not pd.isna(sl_price) and low_price <= sl_price:
+                    return f"SL_MONITOR(L<={sl_price:.2f})"
+            else:  # SHORT
+                if not pd.isna(tp_price) and low_price <= tp_price:
+                    return f"TP_MONITOR(L<={tp_price:.2f})"
+                elif not pd.isna(sl_price) and high_price >= sl_price:
+                    return f"SL_MONITOR(H>={sl_price:.2f})"
             
             return None
             
@@ -577,7 +610,8 @@ class LiveTrader:
             trade_id = trade_details['trade_id']
             direction = trade_details['direction']
             
-            self.logger.info(f"Closing trade {trade_id}: {exit_reason} at {exit_price:.2f}")
+            self.logger.info(f"Closing trade {trade_id} with exit price {exit_price} due to {exit_reason}")
+            self.action_logger.info(f"{datetime.now()} {direction:<4} | EXIT: {trade_details['pattern_tag']} at {exit_price:.2f} due to {exit_reason}")
             
             # Place exit order using trading_token
             exit_transaction_type = (self.order_manager.kite.TRANSACTION_TYPE_SELL 
@@ -593,6 +627,7 @@ class LiveTrader:
             )
             
             # Calculate PnL
+            pnl = 0
             entry_price = trade_details['entry_price']
             if direction == 'LONG':
                 pnl_per_unit = exit_price - entry_price

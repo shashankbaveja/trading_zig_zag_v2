@@ -5,6 +5,16 @@ from myKiteLib import kiteAPIs # Assuming myKiteLib.py is in the same directory 
 from datetime import date, datetime, timedelta # For type hinting and date conversions
 import configparser # Added for reading config file
 import os # Added for file path operations
+import logging
+from collections import deque
+
+# Setup a dedicated logger for strategy signals
+signal_logger = logging.getLogger('strategy_signals')
+signal_logger.setLevel(logging.INFO)
+os.makedirs('logs', exist_ok=True)
+signal_handler = logging.FileHandler('logs/strategy_signals.log', mode='w')
+signal_handler.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
+signal_logger.addHandler(signal_handler)
 
 class DataPrep:
     """
@@ -273,29 +283,40 @@ class BaseStrategy(ABC):
 
 class TradingStrategy(BaseStrategy):
     """
-    This is the main trading strategy class.
-    Implement your custom trading logic in this class.
+    Implements the ZigZag Harmonic trading strategy.
     """
     def __init__(self, kite_apis_instance: kiteAPIs, simulation_actual_start_date: date = None, **kwargs):
         """
-        Initializes the TradingStrategy.
+        Initializes the TradingStrategy with parameters from a config file.
 
         Args:
-            kite_apis_instance: An instance of the kiteAPIs class from myKiteLib.py.
-            simulation_actual_start_date: The actual date from which trading simulation should start.
-                                          Data before this date might be used for indicator warm-up.
-            **kwargs: Strategy-specific parameters. 
-                      Example: instrument_token=256265
+            kite_apis_instance: An instance of the kiteAPIs class.
+            simulation_actual_start_date: The date from which simulation/live trading begins.
+            **kwargs: Strategy parameters, typically from a config file.
         """
+        self.k_apis = kite_apis_instance
+        self.simulation_start_date = simulation_actual_start_date
+        self.logger = logging.getLogger(__name__)  # Standard logger
+        self.signal_logger = logging.getLogger('strategy_signals') # Dedicated signal logger
+        
+        # Deques for recent log items
+        self.recent_pivots = deque(maxlen=10)
+        self.recent_patterns = deque(maxlen=10)
+        self.recent_signals = deque(maxlen=10)
+        
+        # Log the initialization of the strategy
+        self.logger.info("TradingStrategy Initializing...")
+        self.logger.info(f"Received kwargs: {kwargs}")
+
         self.strategy_name = "ZigZagHarmonicStrategy"
-        print(f"Initialized {self.strategy_name}")
+        self.logger.info(f"Initialized {self.strategy_name}")
 
         if not isinstance(kite_apis_instance, kiteAPIs):
             raise TypeError("kite_apis_instance must be an instance of the kiteAPIs class.")
         self.k_apis = kite_apis_instance
         self.simulation_actual_start_date = simulation_actual_start_date
         if self.simulation_actual_start_date:
-            print(f"  {self.strategy_name} actual simulation start date: {self.simulation_actual_start_date}")
+            self.logger.info(f"  {self.strategy_name} actual simulation start date: {self.simulation_actual_start_date}")
         
         # Strategy parameters with defaults, potentially overridden by kwargs from config
         self.target01_ew_rate = float(kwargs.get('target01_ew_rate', 0.236))
@@ -321,7 +342,7 @@ class TradingStrategy(BaseStrategy):
         for key, value in kwargs.items():
             if key.lower() not in processed_keys: # Check lowercase to catch variations from config
                 setattr(self, key, value)
-                print(f"  {self.strategy_name} param set via kwargs: {key} = {value}")
+                self.logger.info(f"  {self.strategy_name} param set via kwargs: {key} = {value}")
             elif key.lower() in processed_keys and not hasattr(self, key):
                 # This case handles if the key was in processed_keys but somehow not set above
                 # (e.g. if default logic changes) or if user wants original string value for some reason.
@@ -329,15 +350,15 @@ class TradingStrategy(BaseStrategy):
                 pass # Already handled with type conversion
 
         # Print critical parameters after they are set
-        print(f"  {self.strategy_name} FINAL param: target01_ew_rate = {self.target01_ew_rate}")
-        print(f"  {self.strategy_name} FINAL param: target01_tp_rate = {self.target01_tp_rate}")
-        print(f"  {self.strategy_name} FINAL param: target01_sl_rate = {self.target01_sl_rate}")
-        print(f"  {self.strategy_name} FINAL param: target02_active = {self.target02_active}")
-        print(f"  {self.strategy_name} FINAL param: target02_ew_rate = {self.target02_ew_rate}")
-        print(f"  {self.strategy_name} FINAL param: target02_tp_rate = {self.target02_tp_rate}")
-        print(f"  {self.strategy_name} FINAL param: target02_sl_rate = {self.target02_sl_rate}")
-        print(f"  {self.strategy_name} FINAL param: useAltTF = {self.useAltTF}")
-        print(f"  {self.strategy_name} FINAL param: altTF_interval_minutes = {self.altTF_interval_minutes}")
+        self.logger.info(f"  {self.strategy_name} FINAL param: target01_ew_rate = {self.target01_ew_rate}")
+        self.logger.info(f"  {self.strategy_name} FINAL param: target01_tp_rate = {self.target01_tp_rate}")
+        self.logger.info(f"  {self.strategy_name} FINAL param: target01_sl_rate = {self.target01_sl_rate}")
+        self.logger.info(f"  {self.strategy_name} FINAL param: target02_active = {self.target02_active}")
+        self.logger.info(f"  {self.strategy_name} FINAL param: target02_ew_rate = {self.target02_ew_rate}")
+        self.logger.info(f"  {self.strategy_name} FINAL param: target02_tp_rate = {self.target02_tp_rate}")
+        self.logger.info(f"  {self.strategy_name} FINAL param: target02_sl_rate = {self.target02_sl_rate}")
+        self.logger.info(f"  {self.strategy_name} FINAL param: useAltTF = {self.useAltTF}")
+        self.logger.info(f"  {self.strategy_name} FINAL param: altTF_interval_minutes = {self.altTF_interval_minutes}")
 
         # Helper list for pattern column names in DataFrame
         self.pattern_names_for_df_columns = [ 
@@ -430,11 +451,11 @@ class TradingStrategy(BaseStrategy):
             if isUp_prev and isDown_curr and prev_pine_direction_for_calc != -1:
                 pivot_price = max(high_curr, high_prev)
                 sz_points_values.iloc[i] = pivot_price
-                print(f"PIVOT DETECTED: HIGH at {current_ts} - Price: {pivot_price:.2f}")
+                self.recent_pivots.append(f"PIVOT DETECTED: HIGH at {current_ts} - Price: {pivot_price:.2f}")
             elif isDown_prev and isUp_curr and prev_pine_direction_for_calc != 1:
                 pivot_price = min(low_curr, low_prev)
                 sz_points_values.iloc[i] = pivot_price
-                print(f"PIVOT DETECTED: LOW at {current_ts} - Price: {pivot_price:.2f}")
+                self.recent_pivots.append(f"PIVOT DETECTED: LOW at {current_ts} - Price: {pivot_price:.2f}")
             
         # Extract non-NaN pivots
         actual_pivots = []
@@ -780,7 +801,7 @@ class TradingStrategy(BaseStrategy):
                     tag = f"{trade['pattern_name']} Long Exit: {exit_reason} (Actual Close: {current_close:.2f}) (Levels from prev. calc)"
                     df.loc[current_dt, 'pattern_tag'] = (df.loc[current_dt, 'pattern_tag'] + " | " + tag 
                                                           if pd.notna(df.loc[current_dt, 'pattern_tag']) else tag)
-                    print(f"{current_dt}: {tag}")
+                    self.recent_signals.append(f"{current_dt}: {tag}")
                     self.active_long_trade = None
                     long_trade_exited_this_candle = True
 
@@ -798,7 +819,7 @@ class TradingStrategy(BaseStrategy):
                     tag = f"{trade['pattern_name']} Short Exit: {exit_reason} (Actual Close: {current_close:.2f}) (Levels from prev. calc)"
                     df.loc[current_dt, 'pattern_tag'] = (df.loc[current_dt, 'pattern_tag'] + " | " + tag 
                                                           if pd.notna(df.loc[current_dt, 'pattern_tag']) else tag)
-                    print(f"{current_dt}: {tag}")
+                    self.recent_signals.append(f"{current_dt}: {tag}")
                     self.active_short_trade = None
                     short_trade_exited_this_candle = True
             
@@ -831,7 +852,7 @@ class TradingStrategy(BaseStrategy):
                             log_msg = (f"{trade['pattern_name']} Long TP/SL re-eval for next check: "
                                        f"Old TP={trade['current_tp_price']:.2f}, Old SL={trade['current_sl_price']:.2f} -> "
                                        f"New TP={new_tp:.2f}, New SL={new_sl:.2f} based on D at {latest_d_pivot_for_calc['timestamp']}")
-                            print(f"{current_dt}: {log_msg}")
+                            # print(f"{current_dt}: {log_msg}")
                             df.loc[current_dt, 'pattern_tag'] = (df.loc[current_dt, 'pattern_tag'] + " | " + log_msg 
                                                                   if pd.notna(df.loc[current_dt, 'pattern_tag']) else log_msg)
                             trade['current_tp_price'] = new_tp
@@ -856,7 +877,7 @@ class TradingStrategy(BaseStrategy):
                             log_msg = (f"{trade['pattern_name']} Short TP/SL re-eval for next check: "
                                        f"Old TP={trade['current_tp_price']:.2f}, Old SL={trade['current_sl_price']:.2f} -> "
                                        f"New TP={new_tp:.2f}, New SL={new_sl:.2f} based on D at {latest_d_pivot_for_calc['timestamp']}")
-                            print(f"{current_dt}: {log_msg}")
+                            # print(f"{current_dt}: {log_msg}")
                             df.loc[current_dt, 'pattern_tag'] = (df.loc[current_dt, 'pattern_tag'] + " | " + log_msg 
                                                                   if pd.notna(df.loc[current_dt, 'pattern_tag']) else log_msg)
                             trade['current_tp_price'] = new_tp
@@ -937,10 +958,11 @@ class TradingStrategy(BaseStrategy):
                             if self.simulation_actual_start_date is None or d_pivot['timestamp'].date() >= self.simulation_actual_start_date:
                                 df.loc[current_dt, 'pattern_tag'] = (df.loc[current_dt, 'pattern_tag'] + " | " + tag 
                                                                   if pd.notna(df.loc[current_dt, 'pattern_tag']) else tag)
-                            print(f"{current_dt}: Potential Pattern Update: {tag}")
+                            self.recent_patterns.append(f"{current_dt}: Potential Pattern Update: {tag}")
                         
                         elif self.latest_identified_pattern and self.latest_identified_pattern['d_timestamp'] != d_pivot['timestamp']:
-                            print(f"{current_dt}: New D-point at {d_pivot['timestamp']} did not form a recognized pattern. Clearing latest_identified_pattern.")
+                            log_msg = f"{current_dt}: New D-point at {d_pivot['timestamp']} did not form a recognized pattern. Clearing latest_identified_pattern."
+                            self.recent_patterns.append(log_msg)
                             self.latest_identified_pattern = None
                             df.loc[current_dt, ['pattern_ew1_price', 'pattern_tp1_price', 'pattern_sl1_price']] = np.nan
             
@@ -976,7 +998,10 @@ class TradingStrategy(BaseStrategy):
                                              f"TP={pattern_for_entry['tp1_price']:.2f}, SL={pattern_for_entry['sl1_price']:.2f})")
                         df.loc[current_dt, 'pattern_tag'] = (df.loc[current_dt, 'pattern_tag'] + " | " + entry_log_message 
                                                               if pd.notna(df.loc[current_dt, 'pattern_tag']) else entry_log_message)
-                        print(f"{current_dt}: {entry_log_message}")
+                        self.recent_signals.append(f"{current_dt}: {entry_log_message}")
+                        # Log the signal
+                        log_message = f"{current_dt} {1:<4} | {entry_log_message}"
+                        self.signal_logger.info(log_message)
                         # long_trade_action_this_candle = True # Not strictly needed here as new entry won't affect same candle exit
 
                 elif pattern_for_entry['mode'] == -1 and self.active_short_trade is None and not short_trade_exited_this_candle:
@@ -1004,12 +1029,24 @@ class TradingStrategy(BaseStrategy):
                                              f"TP={pattern_for_entry['tp1_price']:.2f}, SL={pattern_for_entry['sl1_price']:.2f})")
                         df.loc[current_dt, 'pattern_tag'] = (df.loc[current_dt, 'pattern_tag'] + " | " + entry_log_message 
                                                               if pd.notna(df.loc[current_dt, 'pattern_tag']) else entry_log_message)
-                        print(f"{current_dt}: {entry_log_message}")
+                        self.recent_signals.append(f"{current_dt}: {entry_log_message}")
+                        # Log the signal
+                        log_message = f"{current_dt} {1:<4} | {entry_log_message}"
+                        self.signal_logger.info(log_message)
                         # short_trade_action_this_candle = True # Not strictly needed
 
-        print(f"{self.strategy_name}: Signal generation complete.")
-        print("Signal counts:\n", df['signal'].value_counts())
-        print("Sample pattern tags:\n", df[df['pattern_tag'] != ""]['pattern_tag'].head())
+        # --- Log recent activity summary ---
+        self.logger.info("--- Recent Activity Summary ---")
+        self.logger.info(f"Last {len(self.recent_pivots)} pivots:")
+        for p in self.recent_pivots: self.logger.info(f"  - {p}")
+            
+        self.logger.info(f"Last {len(self.recent_patterns)} pattern updates:")
+        for p in self.recent_patterns: self.logger.info(f"  - {p}")
+            
+        self.logger.info(f"Last {len(self.recent_signals)} signals:")
+        for s in self.recent_signals: self.logger.info(f"  - {s}")
+        self.logger.info("---------------------------------")
+        
         return df
 
 def calculate_performance_metrics(signals_df: pd.DataFrame, 
