@@ -254,6 +254,9 @@ class OrderPlacement(system_initialization):
             str: Order ID if successful, None otherwise.
         """
         try:
+            print(f"[{datetime.datetime.now()}] PLACE_ORDER_LIVE: Preparing to call Kite API.")
+            start_time = time.time()
+            
             order_id = self.kite.place_order(
                 variety=self.kite.VARIETY_REGULAR,
                 exchange=exchange,
@@ -264,13 +267,17 @@ class OrderPlacement(system_initialization):
                 order_type=self.kite.ORDER_TYPE_MARKET,
                 tag=tag
             )
+
+            end_time = time.time()
+            print(f"[{datetime.datetime.now()}] PLACE_ORDER_LIVE: Kite API call finished. Duration: {end_time - start_time:.2f} seconds.")
+
             print(f"OrderPlacement: Market order placed for {tradingsymbol}. Order ID: {order_id}")
             return order_id
         except KiteException as e:
-            print(f"OrderPlacement: Error placing market order for {tradingsymbol}: {e}")
+            print(f"[{datetime.datetime.now()}] PLACE_ORDER_LIVE: Kite API Exception: {e}")
             # Consider specific error handling or re-raising
         except Exception as e:
-            print(f"OrderPlacement: A general error occurred placing market order for {tradingsymbol}: {e}")
+            print(f"[{datetime.datetime.now()}] PLACE_ORDER_LIVE: General Exception: {e}")
         return None
 
     def get_order_history_live(self, order_id: str):

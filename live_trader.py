@@ -261,13 +261,20 @@ class LiveTrader:
                     historical_data.set_index('timestamp', inplace=True)
                     historical_data.index.name = 'date'
                 
+                # --- NEW: Ignore the latest, incomplete candle ---
+                # The strategy should only run on closed, confirmed candles.
+                # We slice the dataframe to exclude the last row.
+                if len(historical_data) > 1:
+                    historical_data = historical_data.iloc[:-1]
+                    self.logger.info(f"Ignoring latest candle. Using data up to {historical_data.index[-1]}")
+
                 # Create data_dict format expected by strategy
                 data_dict = {
                     'main_interval_data': historical_data.copy(),
                     'one_minute_data': historical_data.copy()
                 }
                 
-                self.logger.debug(f"Fetched {len(historical_data)} rows of historical data")
+                self.logger.debug(f"Prepared {len(historical_data)} rows of historical data for strategy")
                 return data_dict
             else:
                 self.logger.warning("No historical data fetched from Kite API")
@@ -288,19 +295,26 @@ class LiveTrader:
             signals_df = self.strategy_instance.generate_signals(data_input_dict=data_dict)
             
             if signals_df.empty:
-                self.logger.warning("Strategy returned empty signals DataFrame")
+                self.logger.info("Strategy returned empty signals DataFrame, which is normal if no new patterns or exits occurred.")
                 return None
             
-            # Get the latest signal
-            latest_signal_row = signals_df.iloc[-1]
-            current_timestamp = signals_df.index[-1]
+            # Filter for all new signals generated in this run
+            new_signals = signals_df[signals_df['signal'] != 0]
+
+            if new_signals.empty:
+                self.logger.debug("No new entry/exit signals generated in this cycle.")
+                return None
+
+            # Get the latest signal from the filtered list
+            latest_signal_row = new_signals.iloc[-1]
+            latest_timestamp = new_signals.index[-1]
             
-            self.logger.debug(f"Latest signal: {latest_signal_row['signal']} at {current_timestamp}")
+            self.logger.debug(f"Latest signal: {latest_signal_row['signal']} at {latest_timestamp}")
             
             return {
-                'signals_df': signals_df,
+                'signals_df': signals_df, # Pass the full DF for context if needed
                 'latest_signal': latest_signal_row['signal'],
-                'latest_timestamp': current_timestamp,
+                'latest_timestamp': latest_timestamp,
                 'latest_row': latest_signal_row
             }
             
@@ -330,13 +344,20 @@ class LiveTrader:
             last_signal_timestamp = signals_with_action.index[-1]
 
             # Avoid re-processing the same signal on subsequent ticks
-            if self.last_signal_timestamp and self.last_signal_timestamp == last_signal_timestamp:
-                self.logger.debug(f"Signal at {last_signal_timestamp} has already been considered. Skipping.")
+            if self.last_signal_timestamp and self.last_signal_timestamp >= last_signal_timestamp:
+                self.logger.debug(f"Signal at {last_signal_timestamp} has already been processed. Skipping.")
                 return
 
             # Check if the signal is too old to act upon
-            current_time = pd.Timestamp.now(tz=last_signal_timestamp.tzinfo)
-            time_difference = current_time - last_signal_timestamp
+            current_time = pd.Timestamp.now(tz='Asia/Kolkata') # Ensure current time is tz-aware
+            
+            # The timestamp from the data is likely already tz-aware. If so, convert; if not, localize.
+            if last_signal_timestamp.tzinfo is None:
+                signal_ts_for_comparison = last_signal_timestamp.tz_localize('Asia/Kolkata')
+            else:
+                signal_ts_for_comparison = last_signal_timestamp.tz_convert('Asia/Kolkata')
+
+            time_difference = current_time - signal_ts_for_comparison
 
             if time_difference > timedelta(minutes=5):
                 self.logger.warning(f"IGNORING STALE SIGNAL from {last_signal_timestamp} "
@@ -352,10 +373,19 @@ class LiveTrader:
             current_price = last_signal_row['close']
             
             # Send Telegram notification for the fresh signal
-            signal_type_text = "BUY/ENTRY SIGNAL" if signal == 1 else "SELL/EXIT SIGNAL"
+            if signal == 1:
+                if 'bull' in pattern_tag.lower() or 'long' in pattern_tag.lower():
+                     signal_type_text = "BUY/LONG SIGNAL"
+                elif 'bear' in pattern_tag.lower() or 'short' in pattern_tag.lower():
+                     signal_type_text = "SELL/SHORT SIGNAL"
+                else:
+                     signal_type_text = "ENTRY SIGNAL (Check Direction)"
+            else: # signal == -1
+                signal_type_text = "EXIT SIGNAL"
+
             self.order_manager.send_telegram_message(
                 f"🔔 FRESH STRATEGY SIGNAL 🔔\n"
-                f"Type: {signal_type_text} ({signal:+d})\n"
+                f"Type: {signal_type_text}\n"
                 f"Price: {current_price:.2f}\n"
                 f"Pattern: {pattern_tag[:70]}...\n"
                 f"Time: {last_signal_timestamp.strftime('%H:%M:%S')}"
@@ -363,25 +393,36 @@ class LiveTrader:
             self.logger.info(f"Telegram notification sent for fresh signal: {signal_type_text} at {current_price:.2f}")
 
             # Process EXIT signals
-            if signal == -1 and self.is_any_trade_active:
-                trades_to_close_ids = list(self.active_trades.keys())
-                closed_count = 0
-                for trade_id in trades_to_close_ids:
-                    trade_details = self.active_trades.get(trade_id)
-                    if trade_details and trade_details.get('status') in ['ACTIVE', 'PENDING_CONFIRMATION']:
-                        self.logger.info(f"Exit signal received for trade {trade_id} with status {trade_details.get('status')}. Closing it.")
-                        self._close_trade(trade_details, current_price, f"STRATEGY_EXIT: {pattern_tag}")
-                        del self.active_trades[trade_id]
-                        closed_count += 1
-                
-                self.is_any_trade_active = len(self.active_trades) > 0
-                if closed_count > 0:
-                    self.logger.info(f"Strategy exit signal processed. Closed {closed_count} trades at {current_price:.2f}")
+            if signal == -1:
+                self.logger.info(f"Processing EXIT signal. Is any trade active? {self.is_any_trade_active}")
+                if self.is_any_trade_active:
+                    trades_to_close_ids = list(self.active_trades.keys())
+                    closed_count = 0
+                    for trade_id in trades_to_close_ids:
+                        trade_details = self.active_trades.get(trade_id)
+                        # Exit if trade is ACTIVE or PENDING (to handle unconfirmed entries)
+                        if trade_details and trade_details.get('status') in ['ACTIVE', 'PENDING_CONFIRMATION']:
+                            self.logger.info(f"Exit signal received for trade {trade_id} with status {trade_details.get('status')}. Closing it.")
+                            self._close_trade(trade_details, current_price, f"STRATEGY_EXIT: {pattern_tag}")
+                            del self.active_trades[trade_id]
+                            closed_count += 1
+                    
+                    self.is_any_trade_active = len(self.active_trades) > 0
+                    if closed_count > 0:
+                        self.logger.info(f"Strategy exit signal processed. Closed {closed_count} trades at {current_price:.2f}")
+                else:
+                    self.logger.info("Exit signal received, but no trade is active. Ignoring.")
 
             # Process ENTRY signals
-            elif signal == 1 and not self.is_any_trade_active:
-                if 'entry' in pattern_tag.lower():
-                    self._initiate_new_trade(last_signal_row, last_signal_timestamp, pattern_tag)
+            elif signal == 1:
+                self.logger.info(f"Processing ENTRY signal. Is any trade active? {self.is_any_trade_active}")
+                if not self.is_any_trade_active:
+                    if 'entry' in pattern_tag.lower():
+                        self._initiate_new_trade(last_signal_row, last_signal_timestamp, pattern_tag)
+                    else:
+                        self.logger.warning(f"Entry signal (1) found, but pattern tag '{pattern_tag}' does not contain 'entry'. Ignoring entry.")
+                else:
+                    self.logger.info("Entry signal received, but a trade is already active. Ignoring.")
             
             # Mark this signal as processed
             self.last_signal_timestamp = last_signal_timestamp
@@ -396,8 +437,17 @@ class LiveTrader:
             
             # Extract pattern information
             pattern_name = self._extract_pattern_name(pattern_tag)
-            trade_direction = self._extract_trade_direction(pattern_tag)
             
+            # --- FIX: Determine trade direction from the reliable pattern_mode ---
+            pattern_mode = signal_row.get('pattern_mode', 0) # 1 for bull/long, -1 for bear/short
+            if pattern_mode == 1:
+                trade_direction = 'LONG'
+            elif pattern_mode == -1:
+                trade_direction = 'SHORT'
+            else:
+                self.logger.error(f"Could not determine trade direction from pattern_mode: {pattern_mode}. Aborting trade initiation.")
+                return
+
             # Generate unique trade ID
             trade_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{trade_direction}_{pattern_name.replace(' ', '')}"
             
