@@ -1,47 +1,38 @@
-import csv
+import pandas as pd
 import os
 import logging
+from datetime import datetime
 
 class TradeLogger:
-    """
-    Handles logging of completed trades to a CSV file.
-    """
-    def __init__(self, file_name: str = "trade_log.csv"):
-        self.file_path = file_name
+    """Handles logging of all completed trades to a CSV file."""
+    def __init__(self, log_dir: str = "logs"):
+        self.log_dir = log_dir
+        self.file_path = os.path.join(self.log_dir, "trade_log.csv")
         self.logger = logging.getLogger(__name__)
-        self._setup_trade_log_file()
+        
+        os.makedirs(self.log_dir, exist_ok=True)
+        self._initialize_log_file()
 
-    def _setup_trade_log_file(self):
-        """Creates the trade log file with headers if it doesn't exist."""
-        try:
-            if not os.path.exists(self.file_path):
-                with open(self.file_path, 'w', newline='') as f:
-                    writer = csv.writer(f)
-                    headers = [
-                        'timestamp', 'trade_id', 'signal_type', 'pattern_name', 
-                        'entry_price', 'exit_price', 'quantity', 'pnl', 
-                        'entry_order_id', 'exit_order_id', 'exit_reason', 
-                        'tp_price', 'sl_price', 'holding_period_minutes'
-                    ]
-                    writer.writerow(headers)
-                self.logger.info(f"Trade log file created at {self.file_path}")
-        except Exception as e:
-            self.logger.error(f"Failed to setup trade log file: {e}", exc_info=True)
-            raise
+    def _initialize_log_file(self):
+        """Creates the log file with a header if it doesn't exist."""
+        if not os.path.exists(self.file_path):
+            header = [
+                'timestamp', 'trade_id', 'signal_type', 'pattern_name',
+                'entry_price', 'exit_price', 'quantity', 'pnl',
+                'entry_order_id', 'exit_order_id', 'exit_reason',
+                'tp_price', 'sl_price', 'holding_period_minutes'
+            ]
+            try:
+                pd.DataFrame(columns=header).to_csv(self.file_path, index=False)
+                self.logger.info(f"Trade log created at {self.file_path}")
+            except Exception as e:
+                self.logger.error(f"Failed to create trade log: {e}")
 
     def log_trade(self, trade_data: dict):
-        """Appends a single trade record to the CSV file."""
+        """Appends a completed trade to the CSV log."""
         try:
-            with open(self.file_path, 'a', newline='') as f:
-                # Ensure all headers are present in the dict to avoid errors
-                fieldnames = [
-                    'timestamp', 'trade_id', 'signal_type', 'pattern_name', 
-                    'entry_price', 'exit_price', 'quantity', 'pnl', 
-                    'entry_order_id', 'exit_order_id', 'exit_reason', 
-                    'tp_price', 'sl_price', 'holding_period_minutes'
-                ]
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writerow(trade_data)
-            self.logger.info(f"Successfully logged trade {trade_data.get('trade_id')}")
+            trade_df = pd.DataFrame([trade_data])
+            trade_df.to_csv(self.file_path, mode='a', header=False, index=False)
+            self.logger.info(f"Logged trade {trade_data.get('trade_id')} to {self.file_path}")
         except Exception as e:
-            self.logger.error(f"Error logging trade: {e}", exc_info=True) 
+            self.logger.error(f"Failed to log trade: {e}") 

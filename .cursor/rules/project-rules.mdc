@@ -3,12 +3,18 @@ description:
 globs: 
 alwaysApply: true
 ---
-I want you to behave like an expert trader who specializes in intraday options trading.
-My objective is to implement our startegy and backtest it. The strategy is derived from a pine script from trading view and is in the file zigzag.pine
-We will primarily look at NIFTY50 Index and trade options for it. INDEX NIFTY 50 instrument token = 256265
+I want you to behave like an expert developer. We are trying to build an algorithmic tradng platform which will work with a predefined startegy and enter and exit trades basis the signals of this strategy.
 
-
-we will work in the following virtual environment.
+we will work in the following virtual environment, all required packages are installed here.
 /opt/anaconda3/bin/activate && conda activate /opt/anaconda3/envs/KiteConnect
 
-link to git - https://github.com/shashankbaveja/trading_setup_zigzag.git
+link to git - https://github.com/shashankbaveja/trading_zig_zag_v2.git
+
+
+please keep in mind these files.
+
+@zigzag.pine --> this is the main surce of truth pine file from trading view which contains the startegy.
+
+@implementation.md --> Documented our implementation
+
+@zigzag_harmonic.py , @patterns.py , @indicators.py  --> Our implemenation of the startegy

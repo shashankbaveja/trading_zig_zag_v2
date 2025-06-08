@@ -23,6 +23,129 @@ import matplotlib.pyplot as plt
 telegramToken_global = '8135376207:AAFoMWbyucyPPEzc7CYeAMTsNZfqHWYDMfw' # Renamed to avoid conflict
 telegramChatId_global = "-4653665640"
 
+def convert_minute_data_interval(df, to_interval=1):
+    if to_interval == 1:
+        return df
+    
+    if df is None or df.empty:
+        return pd.DataFrame() # Return empty DataFrame if input is empty
+
+    if not isinstance(to_interval, int) or to_interval <= 0:
+        raise ValueError("to_interval must be a positive integer.")
+
+    # Ensure 'timestamp' column exists and is in datetime format
+    # Assuming the datetime column is named 'timestamp' as per requirements.
+    # If it's 'date' from getHistoricalData, it should be handled/renamed before this function
+    # or this function should be adapted. For now, proceeding with 'timestamp'.
+    if 'timestamp' not in df.columns:
+        # Try to use 'date' column if 'timestamp' is missing, assuming it's the datetime column
+        if 'date' in df.columns:
+            df = df.rename(columns={'date': 'timestamp'}) 
+        else:
+            raise ValueError("DataFrame must contain a 'timestamp' or 'date' column for resampling.")
+    
+    try:
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+    except Exception as e:
+        raise ValueError(f"Could not convert 'timestamp' column to datetime: {e}")
+
+    # The logic below assumes 'instrument_token' exists.
+    # If it doesn't, we can add a dummy one since we're resampling a single instrument's data.
+    df_copy = df.copy()
+    added_dummy_token = False
+    if 'instrument_token' not in df_copy.columns:
+        df_copy['instrument_token'] = 1 # Dummy token for grouping
+        added_dummy_token = True
+
+
+    # Sort by instrument_token and timestamp
+    df_copy = df_copy.sort_values(by=['instrument_token', 'timestamp'])
+
+    # Define base aggregation rules - only use columns that exist
+    base_agg_rules = {
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last',
+        'volume': 'sum'
+    }
+    
+    # Add optional columns if they exist
+    optional_columns = {
+        'id': 'first',
+        'strike': 'first'
+    }
+    
+    # Build final aggregation rules based on available columns
+    agg_rules = base_agg_rules.copy()
+    for col, agg_func in optional_columns.items():
+        if col in df_copy.columns:
+            agg_rules[col] = agg_func
+
+    all_resampled_dfs = []
+
+    # Group by instrument_token and then by day for resampling
+    # The pd.Grouper will use the 'timestamp' column, group by Day ('D'), using start_day as origin for daily grouping.
+    grouped_by_token_day = df_copy.groupby([
+        'instrument_token', 
+        pd.Grouper(key='timestamp', freq='D', origin='start_day')
+    ])
+
+    for (token, day_key), group_data in grouped_by_token_day:
+        if group_data.empty:
+            continue
+
+        # Define the resampling origin for this specific day: 9:15 AM
+        # day_key is the start of the day (00:00:00) from the Grouper
+        origin_time_for_day = day_key + pd.Timedelta(hours=9, minutes=15)
+
+        # Set timestamp as index for resampling this group
+        group_data_indexed = group_data.set_index('timestamp')
+        
+        resampled_one_group = group_data_indexed.resample(
+            rule=f'{to_interval}min',
+            label='left', # Label of the interval is its start time
+            origin=origin_time_for_day
+        ).agg(agg_rules)
+
+        # Drop rows where 'open' is NaN (meaning no data fell into this resampled interval)
+        resampled_one_group = resampled_one_group.dropna(subset=['open'])
+
+        if not resampled_one_group.empty:
+            # Add instrument_token back as a column
+            resampled_one_group['instrument_token'] = token
+            all_resampled_dfs.append(resampled_one_group)
+    
+    if not all_resampled_dfs:
+        return pd.DataFrame(columns=df.columns) # Return empty DF with original columns
+
+    final_df = pd.concat(all_resampled_dfs)
+    final_df = final_df.reset_index() # 'timestamp' becomes a column
+
+    if added_dummy_token:
+        final_df = final_df.drop(columns=['instrument_token'])
+
+    # Define desired column order
+    # (Make sure all these columns exist in final_df after aggregation and reset_index)
+    # 'instrument_token' added above, 'timestamp' from reset_index
+    base_desired_columns = ['open', 'high', 'low', 'close', 'volume', 'timestamp']
+    optional_desired_columns = ['ID', 'id', 'strike']
+    
+    # Build final desired columns list based on what exists
+    desired_columns = []
+    for col in base_desired_columns:
+        if col in final_df.columns:
+            desired_columns.append(col)
+    
+    for col in optional_desired_columns:
+        if col in final_df.columns:
+            desired_columns.append(col)
+    
+    # Filter and reorder
+    final_df = final_df[[col for col in desired_columns if col in final_df.columns]]
+    
+    return final_df
+
 class system_initialization:
     def __init__(self):
         
@@ -33,7 +156,7 @@ class system_initialization:
         self.telegram_token = telegramToken_global
         self.telegram_chat_id = telegramChatId_global
 
-        config_file_path = "./security.txt"
+        config_file_path = "security.txt"
         with open(config_file_path, 'r') as file:
             content = file.read()
 
@@ -49,7 +172,7 @@ class system_initialization:
         self.mysql_hostname = self.config["hostname"]
         self.mysql_port = int(self.config["port"])
         self.mysql_database_name = self.config["database_name"]
-        self.AccessToken = self.config["AccessToken"]
+        self.AccessToken = self.config.get("AccessToken") # Use .get() for safety
 
         print("read security details")
 
@@ -71,7 +194,7 @@ class system_initialization:
 
             # Update the in-memory configuration and write to security.txt
             self.config["AccessToken"] = AccessToken # Update self.config dict
-            config_file_path = "./security.txt"
+            config_file_path = "security.txt"
             try:
                 with open(config_file_path, 'w') as file:
                     json.dump(self.config, file, indent=4) # Write the whole updated config
@@ -211,9 +334,9 @@ class system_initialization:
 class OrderPlacement(system_initialization):
     def __init__(self):
         super().__init__() # Initialize the base class to get self.kite, etc.
-        self.k_apis = kiteAPIs()  # Create instance of kiteAPIs
+        # self.k_apis = kiteAPIs()  # This seems to cause a circular dependency or redundant initialization
         print("OrderPlacement module initialized. Ensure init_trading() is called if access token needs refresh.")
-
+        
     def send_telegram_message(self, message: str):
         """
         Sends a message to the configured Telegram chat.
@@ -440,10 +563,6 @@ class kiteAPIs:
         query = f"SELECT instrument_token FROM kiteConnect.instruments_zerodha where tradingsymbol in ({symbol}) and instrument_type = 'EQ'"
         self.con = sqlConnector.connect(host=self.mysql_hostname, user=self.mysql_username, password=self.mysql_password, database=self.mysql_database_name, port=self.mysql_port,auth_plugin='mysql_native_password')
         df = pd.read_sql(query, self.con)
-        # if len(df) > 0:
-        #     return int(df.iloc[0,0])
-        # else:
-        #     return -1
         self.con.close()
         return df['instrument_token'].values.astype(int).tolist()
     # getting all the instrument tokens for a given instrument type
@@ -468,119 +587,6 @@ class kiteAPIs:
         self.con.close()
         return df
     
-    def convert_minute_data_interval(self, df, to_interval=1):
-        if to_interval == 1:
-            return df
-        
-        if df is None or df.empty:
-            return pd.DataFrame() # Return empty DataFrame if input is empty
-
-        if not isinstance(to_interval, int) or to_interval <= 0:
-            raise ValueError("to_interval must be a positive integer.")
-
-        # Ensure 'timestamp' column exists and is in datetime format
-        # Assuming the datetime column is named 'timestamp' as per requirements.
-        # If it's 'date' from getHistoricalData, it should be handled/renamed before this function
-        # or this function should be adapted. For now, proceeding with 'timestamp'.
-        if 'timestamp' not in df.columns:
-            # Try to use 'date' column if 'timestamp' is missing, assuming it's the datetime column
-            if 'date' in df.columns:
-                df = df.rename(columns={'date': 'timestamp'}) 
-            else:
-                raise ValueError("DataFrame must contain a 'timestamp' or 'date' column for resampling.")
-        
-        try:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-        except Exception as e:
-            raise ValueError(f"Could not convert 'timestamp' column to datetime: {e}")
-
-        # Sort by instrument_token and timestamp
-        df = df.sort_values(by=['instrument_token', 'timestamp'])
-
-        # Define base aggregation rules - only use columns that exist
-        base_agg_rules = {
-            'open': 'first',
-            'high': 'max',
-            'low': 'min',
-            'close': 'last',
-            'volume': 'sum'
-        }
-        
-        # Add optional columns if they exist
-        optional_columns = {
-            'id': 'first',
-            'strike': 'first'
-        }
-        
-        # Build final aggregation rules based on available columns
-        agg_rules = base_agg_rules.copy()
-        for col, agg_func in optional_columns.items():
-            if col in df.columns:
-                agg_rules[col] = agg_func
-
-        all_resampled_dfs = []
-
-        # Group by instrument_token and then by day for resampling
-        # The pd.Grouper will use the 'timestamp' column, group by Day ('D'), using start_day as origin for daily grouping.
-        grouped_by_token_day = df.groupby([
-            'instrument_token', 
-            pd.Grouper(key='timestamp', freq='D', origin='start_day')
-        ])
-
-        for (token, day_key), group_data in grouped_by_token_day:
-            if group_data.empty:
-                continue
-
-            # Define the resampling origin for this specific day: 9:15 AM
-            # day_key is the start of the day (00:00:00) from the Grouper
-            origin_time_for_day = day_key + pd.Timedelta(hours=9, minutes=15)
-
-            # Set timestamp as index for resampling this group
-            group_data_indexed = group_data.set_index('timestamp')
-            
-            resampled_one_group = group_data_indexed.resample(
-                rule=f'{to_interval}min',
-                label='left', # Label of the interval is its start time
-                origin=origin_time_for_day
-            ).agg(agg_rules)
-
-            # Drop rows where 'open' is NaN (meaning no data fell into this resampled interval)
-            resampled_one_group = resampled_one_group.dropna(subset=['open'])
-
-            if not resampled_one_group.empty:
-                # Add instrument_token back as a column
-                resampled_one_group['instrument_token'] = token
-                all_resampled_dfs.append(resampled_one_group)
-        
-        if not all_resampled_dfs:
-            return pd.DataFrame(columns=df.columns) # Return empty DF with original columns
-
-        final_df = pd.concat(all_resampled_dfs)
-        final_df = final_df.reset_index() # 'timestamp' becomes a column
-
-        # Define desired column order
-        # (Make sure all these columns exist in final_df after aggregation and reset_index)
-        # 'instrument_token' added above, 'timestamp' from reset_index
-        base_desired_columns = ['instrument_token', 'open', 'high', 'low', 'close', 'volume', 'timestamp']
-        optional_desired_columns = ['ID', 'id', 'strike']
-        
-        # Build final desired columns list based on what exists
-        desired_columns = []
-        for col in base_desired_columns:
-            if col in final_df.columns:
-                desired_columns.append(col)
-        
-        for col in optional_desired_columns:
-            if col in final_df.columns:
-                desired_columns.append(col)
-        
-        # Filter and reorder
-        final_df = final_df[desired_columns]
-        
-        return final_df
-
-    ## get data from kite API for a given token, from_date, to_date, interval
-
     def getHistoricalData(self, from_date, to_date, tokens, interval):
         # embed()
         if from_date > to_date:
@@ -597,11 +603,11 @@ class kiteAPIs:
         RETRY_DELAY_SECONDS = 5
 
         for t in tokens:
-            print(f"Fetching data for token: {t}")
+            # print(f"Fetching data for token: {t}")
             records = None # Initialize records to None
             for attempt in range(MAX_RETRIES):
                 try:
-                    print(f"  Attempt {attempt + 1}/{MAX_RETRIES} for token {t}...")
+                    # print(f"  Attempt {attempt + 1}/{MAX_RETRIES} for token {t}...")
                     records = self.kite.historical_data(t, from_date=from_date, to_date=to_date, interval=interval)
                     print(f"  Successfully fetched data for token {t} on attempt {attempt + 1}.")
                     break  # Success, exit retry loop
@@ -674,10 +680,10 @@ class kiteAPIs:
                         # query = f"INSERT IGNORE INTO {target_table_name} VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
 
 
-                        print(f"Attempting to bulk insert {len(data_to_insert)} records into {target_table_name}...")
+                        # print(f"Attempting to bulk insert {len(data_to_insert)} records into {target_table_name}...")
                         cur.executemany(query, data_to_insert)
                         self.con.commit()
-                        print(f"Bulk insert/ignore completed for {target_table_name}. Rows affected: {cur.rowcount}")
+                        # print(f"Bulk insert/ignore completed for {target_table_name}. Rows affected: {cur.rowcount}")
                     except Exception as e: # Catch potential errors during DB operation
                         print(f"Error during bulk insert into {target_table_name}: {e}")
                         # Consider self.con.rollback() if an error occurs and transactions are being used explicitly

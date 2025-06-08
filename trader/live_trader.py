@@ -1,11 +1,11 @@
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, time as dt_time
 import configparser
 import pandas as pd
 
 # Refactored local imports
-from core.data_handler import DataHandler
+from trader.data_handler import DataHandler
 from strategy.zigzag_harmonic import ZigZagHarmonicStrategy
 from trader.session_manager import SessionManager
 from trader.order_manager import OrderManager
@@ -17,17 +17,16 @@ class LiveTrader:
     The central orchestrator for the live trading bot.
     Connects all the modular components to run the trading session.
     """
-    def __init__(self, config_file_path: str, replay_date: str = None):
+    def __init__(self, config_file_path: str, replay_timestamp: datetime = None):
         """
         Initializes the LiveTrader.
         Args:
             config_file_path (str): Path to the configuration file.
-            replay_date (str, optional): The date to run in replay mode (YYYY-MM-DD). Defaults to None for live mode.
+            replay_timestamp (datetime, optional): The timestamp to start a replay from. Defaults to None for live mode.
         """
         self.logger = logging.getLogger(__name__)
         self.config_file_path = config_file_path
-        
-        self.replay_date_obj = datetime.strptime(replay_date, '%Y-%m-%d').date() if replay_date else None
+        self.replay_timestamp = replay_timestamp
         
         self._load_config()
         self._initialize_components()
@@ -42,8 +41,8 @@ class LiveTrader:
         if not self.config.read(self.config_file_path):
             raise FileNotFoundError(f"Config file not found: {self.config_file_path}")
         
-        self.strategy_config = dict(self.config['TRADING_STRATEGY'])
-        self.trader_config = dict(self.config['LIVE_TRADER_SETTINGS'])
+        self.strategy_config = self.config['TRADING_STRATEGY']
+        self.trader_config = self.config['LIVE_TRADER_SETTINGS']
         self.logger.info("Configuration loaded successfully.")
 
     def _initialize_components(self):
@@ -54,8 +53,8 @@ class LiveTrader:
         self.position_manager = PositionManager(trade_logger=self.trade_logger)
         self.strategy = ZigZagHarmonicStrategy(**self.strategy_config)
         
-        # The DataHandler is now initialized with the replay date if provided
-        self.data_handler = DataHandler(config=self.trader_config, replay_date=self.replay_date_obj)
+        # DataHandler is now initialized without replay information
+        self.data_handler = DataHandler(config=self.trader_config, replay_date=None)
         
         self.logger.info("All components initialized.")
 
@@ -67,24 +66,23 @@ class LiveTrader:
             loop_start_time = time.time()
             
             try:
-                self.session_manager.manage_session()
-
-                # If in replay mode, we can ignore real-time session checks
-                is_trading_time = self.session_manager.is_trade_allowed
-                if self.replay_date_obj:
-                    is_trading_time = True # Always allow trading during replay
-
-                if not is_trading_time:
-                    if not self.session_manager.is_session_active:
-                        break # Exit loop if session ended
-                    time.sleep(self.polling_interval)
-                    continue
-
-                # Fetch the latest market data
-                data_dict = self.data_handler.fetch_latest_data()
+                # In replay mode, we don't need real-time session management
+                if not self.replay_timestamp:
+                    self.session_manager.manage_session()
+                    if not self.session_manager.is_trade_allowed:
+                        if not self.session_manager.is_session_active:
+                            break # Exit loop if session ended
+                        time.sleep(self.polling_interval)
+                        continue
+                
+                # Fetch the latest market data, passing the replay timestamp if it exists
+                data_dict = self.data_handler.fetch_latest_data(current_timestamp=self.replay_timestamp)
                 if not data_dict or data_dict['main_interval_data'].empty:
                     self.logger.warning("No data received from data handler. Skipping tick.")
-                    time.sleep(self.polling_interval)
+                    if self.replay_timestamp:
+                        self.replay_timestamp += timedelta(seconds=self.polling_interval)
+                    else:
+                        time.sleep(self.polling_interval)
                     continue
 
                 latest_candle = data_dict['main_interval_data'].iloc[-1]
@@ -102,11 +100,31 @@ class LiveTrader:
                 break
             except Exception as e:
                 self.logger.error(f"An unexpected error occurred in the main loop: {e}", exc_info=True)
-
-            # Maintain polling interval
+            
             loop_duration = time.time() - loop_start_time
-            sleep_time = max(0, self.polling_interval - loop_duration)
-            time.sleep(sleep_time)
+            if self.replay_timestamp:
+                # In replay mode, advance the simulation time
+                sleep_time = max(0, self.polling_interval - loop_duration)
+                self.replay_timestamp += timedelta(seconds=(loop_duration + sleep_time))
+
+                # If the replay time is past the market close, jump to the next day's open
+                if self.replay_timestamp.time() > dt_time(15, 30):
+                    self.logger.info(f"Replay timestamp {self.replay_timestamp} is past 15:30. Jumping to next trading day.")
+                    next_day = self.replay_timestamp.date() + timedelta(days=1)
+                    # Set to 9:15 AM for the next session
+                    self.replay_timestamp = self.replay_timestamp.replace(
+                        year=next_day.year, month=next_day.month, day=next_day.day,
+                        hour=9, minute=15, second=0, microsecond=0
+                    )
+                
+                self.logger.info(f"Replay time advanced to: {self.replay_timestamp}")
+
+                # The original polling interval logic is now handled by advancing the timestamp.
+                # We keep a small, fixed sleep to control replay speed without affecting time calculations.
+                time.sleep(0.2)
+            else:
+                sleep_time = max(0, self.polling_interval - loop_duration)
+                time.sleep(sleep_time)
             
         self.logger.info(f"--- Live Trading Session Ended. Final Daily PnL: {self.daily_pnl:.2f} ---")
 
@@ -117,10 +135,16 @@ class LiveTrader:
             self.logger.info(f"Exit signal received: {exit_reason}")
             
             active_trade = self.position_manager.active_trade
-            exit_order_id = self.order_manager.place_exit_order(
-                direction=active_trade['direction'],
-                reason=exit_reason
-            )
+            
+            # In replay mode, we simulate the order placement
+            if self.replay_timestamp:
+                exit_order_id = f"REPLAY_EXIT_{int(self.replay_timestamp.timestamp())}"
+                self.logger.info(f"SIMULATING EXIT ORDER: {exit_order_id}")
+            else:
+                exit_order_id = self.order_manager.place_exit_order(
+                    direction=active_trade['direction'],
+                    reason=exit_reason
+                )
             
             if exit_order_id:
                 # For simplicity, we use the candle's close as exit price.
@@ -136,32 +160,29 @@ class LiveTrader:
 
     def _check_for_new_trade(self, data_dict: dict, latest_price: float):
         """Checks for a new entry signal from the strategy."""
-        signal = self.strategy.check_for_signal(data_dict)
+        signal = self.strategy.check_for_signal(
+            data_dict=data_dict,
+            latest_price=latest_price,
+            replay_timestamp=self.replay_timestamp
+        )
         if signal:
-            self.logger.info(f"New trade signal from strategy: {signal['pattern_name']}")
-            
-            # Check if current price is within the entry window
-            if self._is_price_in_entry_window(latest_price, signal):
-                self._execute_new_trade(signal, latest_price)
-            else:
-                self.logger.info("Signal found, but current price is outside the entry window. No action taken.")
-
-    def _is_price_in_entry_window(self, price: float, signal: dict) -> bool:
-        """Checks if the price is valid for entry based on the signal."""
-        entry_window = signal['entry_window_price']
-        if signal['direction'] == 'LONG':
-            return price <= entry_window
-        else: # SHORT
-            return price >= entry_window
+            self.logger.info(f"New executable trade signal from strategy: {signal['pattern_name']}")
+            self._execute_new_trade(signal, latest_price)
 
     def _execute_new_trade(self, signal: dict, entry_price: float):
         """Executes and starts tracking a new trade."""
-        trade_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{signal['direction']}"
+        current_time = self.replay_timestamp if self.replay_timestamp else datetime.now()
+        trade_id = f"{current_time.strftime('%Y%m%d_%H%M%S')}_{signal['direction']}"
         
-        entry_order_id = self.order_manager.place_entry_order(
-            direction=signal['direction'],
-            pattern_name=signal['pattern_name']
-        )
+        # In replay mode, we simulate the order placement
+        if self.replay_timestamp:
+            entry_order_id = f"REPLAY_ENTRY_{int(self.replay_timestamp.timestamp())}"
+            self.logger.info(f"SIMULATING ENTRY ORDER: {entry_order_id}")
+        else:
+            entry_order_id = self.order_manager.place_entry_order(
+                direction=signal['direction'],
+                pattern_name=signal['pattern_name']
+            )
         
         if entry_order_id:
             self.logger.info(f"Successfully placed entry order {entry_order_id} for trade {trade_id}.")

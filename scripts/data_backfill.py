@@ -2,6 +2,14 @@
 
 # 0 16 * * * cd /Users/shashankbaveja/Downloads/Personal/KiteConnectAPI/trading_setup && /opt/anaconda3/envs/KiteConnect/bin/python data_backfill.py >> /Users/shashankbaveja/Downloads/Personal/KiteConnectAPI/trading_setup/data_backfill_cron.log 2>&1
 
+# Add project root to sys.path to resolve module imports
+import sys
+import os
+# Set the project root and change the current working directory to it.
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, project_root)
+os.chdir(project_root)
+
 from IPython import embed;
 from kiteconnect import KiteConnect, KiteTicker
 import mysql
@@ -15,8 +23,7 @@ import time
 import pandas as pd
 from sqlalchemy import create_engine
 import pymysql
-from myKiteLib import system_initialization
-from myKiteLib import kiteAPIs
+from trader.myKiteLib import system_initialization, kiteAPIs
 import logging
 import json
 from datetime import date, timedelta, datetime, time
@@ -44,10 +51,13 @@ if __name__ == "__main__":
     start_date_val = today_date - timedelta(days=BACKFILL_DAYS)
     start_dt_backfill = datetime.combine(start_date_val, time(0, 0, 0))
 
+    print(f"starting system_init")
     systemDetails = system_initialization()
+    print(f"starting init_trading")
     systemDetails.init_trading()
+    print(f"starting kiteAPIs")
     callKite = kiteAPIs()
-
+    print(f"starting get_instrument_active_tokens")
     tokenList = [256265] ## NIFTY INDEX
     tokenList.extend(callKite.get_instrument_active_tokens('CE',end_dt_backfill))
     tokenList.extend(callKite.get_instrument_active_tokens('PE',end_dt_backfill))

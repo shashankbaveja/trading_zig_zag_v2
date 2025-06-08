@@ -4,7 +4,7 @@
 # This script activates the conda environment and runs data backfill
 
 # Set working directory
-cd "/Users/shashankbaveja/Main/Projects/KiteConnectAPI/trading_setup ZigZag"
+cd "/Users/shashankbaveja/Main/Projects/KiteConnectAPI/trading_setup ZigZag/scripts"
 
 # Create logs directory if it doesn't exist
 mkdir -p logs

@@ -1,7 +1,7 @@
 import logging
 import time
 from datetime import datetime
-from myKiteLib import OrderPlacement as KiteOrderPlacement
+from .myKiteLib import OrderPlacement as KiteOrderPlacement
 
 class OrderManager:
     """
@@ -107,6 +107,19 @@ class OrderManager:
             self.logger.error(f"Failed to place exit order: {e}", exc_info=True)
             self.send_telegram_notification(f"🚨 FAILED to place exit order for {direction} trade!")
             return None
+
+    def check_api_connection(self) -> bool:
+        """
+        Performs a simple API check to confirm the connection is healthy.
+        Returns:
+            bool: True if the connection is active, False otherwise.
+        """
+        try:
+            profile = self.kite_om.kite.profile()
+            return profile and 'user_id' in profile
+        except Exception as e:
+            self.logger.error(f"API health check failed: {e}")
+            return False
 
     def get_order_average_price(self, order_id: str) -> float | None:
         """
